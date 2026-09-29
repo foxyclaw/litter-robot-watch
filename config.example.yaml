@@ -30,7 +30,8 @@ checks:
           - "DF2"
           - "DFS"
           - "DRAWER_FULL"
-        waste_threshold: 95
+        waste_threshold: 90
+        waste_repeat_seconds: 10800  # repeat waste alert at most every 3h
         error_statuses:
           - "CSF"
           - "BR"

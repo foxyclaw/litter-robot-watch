@@ -212,30 +212,16 @@ class LitterRobotCheck(BaseCheck):
         waste_levels = alert_cfg.get("waste_levels", [])
         error_statuses = alert_cfg.get("error_statuses", [])
 
-        # Primary drawer-full detection: use the boolean flag from the robot.
-        # This fires even when % is below the threshold (e.g. 93%).
-        is_full = state.get("is_waste_drawer_full", False)
+        # Waste alert: trust the percentage only (ignore is_waste_drawer_full / status codes).
         waste_level = state.get("waste_drawer_level")
-
-        if is_full or status in waste_levels:
-            pct_str = f" ({waste_level}%)" if waste_level is not None else ""
+        threshold = alert_cfg.get("waste_threshold", 90)
+        if waste_level is not None and waste_level >= threshold:
             await self._trigger_alert(
-                robot_id, "waste_drawer",
-                f"🗑️ {robot_name}: Drawer full{pct_str}! Empty the waste drawer.",
+                robot_id, "waste_pct",
+                f"🗑️ {robot_name}: Waste drawer at {waste_level}%!",
                 telegram_only=True,
                 waste_level=waste_level,
             )
-
-        # Secondary: percentage threshold alert (only if not already full)
-        if waste_level is not None and not is_full and status not in waste_levels:
-            threshold = alert_cfg.get("waste_threshold", 95)
-            if waste_level >= threshold:
-                await self._trigger_alert(
-                    robot_id, "waste_pct",
-                    f"🗑️ {robot_name}: Waste drawer at {waste_level}%!",
-                    telegram_only=True,
-                    waste_level=waste_level,
-                )
 
         if status in error_statuses:
             await self._trigger_alert(
@@ -280,7 +266,10 @@ class LitterRobotCheck(BaseCheck):
     ) -> None:
         cooldown_key = f"{robot_id}:{alert_type}"
         now = datetime.now()
-        cooldown_seconds = 3600 if telegram_only else 300
+        if telegram_only:
+            cooldown_seconds = self.config.get("alerts", {}).get("waste_repeat_seconds", 10800)
+        else:
+            cooldown_seconds = 300
         if cooldown_key in self._alert_cooldown:
             if (now - self._alert_cooldown[cooldown_key]).total_seconds() < cooldown_seconds:
                 return
