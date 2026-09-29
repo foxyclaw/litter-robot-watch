@@ -1,0 +1,57 @@
+# Watchdog Services — multi-function monitoring config
+# Add new checks under "checks:" with their own interval_seconds.
+
+# Global Telegram bot (used as fallback; checks can override with their own bot)
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: "YOUR_TELEGRAM_CHAT_ID"
+
+# Logging
+logging:
+  log_file: "/path/to/litter-robot-watch/litter_monitor.log"
+  log_level: "INFO"
+
+# ── Checks ────────────────────────────────────────────────────────────────────
+checks:
+
+  # ── Litter Robot / Whisker ──────────────────────────────────────────────────
+  - name: litter_robot
+    enabled: true
+    interval_seconds: 300
+    config:
+      whisker:
+        email: "you@example.com"
+        password: "YOUR_WHISKER_PASSWORD"
+      database: "/path/to/litter-robot-watch/litter_robot.db"
+      # telegram: omitted → falls back to global bot above
+      alerts:
+        waste_levels:
+          - "DF1"
+          - "DF2"
+          - "DFS"
+          - "DRAWER_FULL"
+        waste_threshold: 95
+        error_statuses:
+          - "CSF"
+          - "BR"
+          - "CSI"
+          - "P"
+          - "OFF"
+
+  # ── Stock Price Alerts (Alpaca API, no LLM) ─────────────────────────────────
+  - name: stock_price
+    enabled: true
+    interval_seconds: 300  # каждые 5 минут
+    config:
+      alpaca_key: "YOUR_ALPACA_KEY"
+      alpaca_secret: "YOUR_ALPACA_SECRET"
+      state_file: "/path/to/litter-robot-watch/stock_price_state.json"
+
+      telegram:
+        bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+        chat_id: "YOUR_TELEGRAM_CHAT_ID"
+      # Watches: list of symbols + thresholds
+      watches:
+        - symbol: "GOOG"
+          threshold: 398
+          direction: "above"   # alert when price >= threshold

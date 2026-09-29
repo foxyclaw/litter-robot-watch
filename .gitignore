@@ -1,0 +1,12 @@
+config.yaml
+*.bak-*
+*.db
+*.db-*
+*.log
+venv/
+.venv/
+__pycache__/
+*.pyc
+stock_price_state.json
+.env
+.DS_Store

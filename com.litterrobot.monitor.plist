@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.litterrobot.monitor</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/venv/bin/python</string>
+        <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/main.py</string>
+        <string>daemon</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/foxyclaw/.openclaw/workspace/litter_monitor</string>
+    
+    <key>UserName</key>
+    <string>foxyclaw</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/foxyclaw</string>
+    </dict>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+    
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/daemon.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/daemon.error.log</string>
+    
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
