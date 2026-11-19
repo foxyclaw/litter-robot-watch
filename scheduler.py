@@ -23,7 +23,11 @@ class CheckScheduler:
         while True:
             now = time.time()
             for entry in self._checks:
-                if now - entry["last_run"] >= entry["interval"]:
+                # A check may ask for a temporarily shorter interval (e.g. the
+                # litter robot polls faster while a cycle is in progress).
+                override = getattr(entry["check"], "interval_override", None)
+                interval = min(entry["interval"], override) if override else entry["interval"]
+                if now - entry["last_run"] >= interval:
                     check = entry["check"]
                     try:
                         self.logger.debug(f"→ Running {check.name}")

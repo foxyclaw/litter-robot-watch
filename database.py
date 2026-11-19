@@ -16,6 +16,8 @@ class LitterRobotDatabase:
     async def connect(self) -> None:
         """Initialize database connection and tables."""
         self._connection = await aiosqlite.connect(self.db_path)
+        # The daemon and one-off CLI commands may share the file.
+        await self._connection.execute("PRAGMA busy_timeout = 10000")
         await self._create_tables()
     
     async def disconnect(self) -> None:
@@ -113,6 +115,50 @@ class LitterRobotDatabase:
         await self._connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_drawer_events_robot_id
             ON drawer_events(robot_id)
+        """)
+
+        # ── Forensic tables ──────────────────────────────────────────────────
+        # Full raw robot.to_dict() per poll / websocket update.
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS raw_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts DATETIME NOT NULL,
+                robot_id TEXT NOT NULL,
+                source TEXT,
+                status TEXT,
+                json TEXT NOT NULL
+            )
+        """)
+        await self._connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_raw_snapshots_robot_ts
+            ON raw_snapshots(robot_id, ts)
+        """)
+
+        # Our own copy of the Whisker activity feed (cloud keeps ~6 days only).
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS activity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                robot_id TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                action TEXT NOT NULL,
+                action_value TEXT NOT NULL DEFAULT '',
+                raw_json TEXT,
+                first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(robot_id, timestamp, action, action_value)
+            )
+        """)
+        await self._connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_activity_history_robot_ts
+            ON activity_history(robot_id, timestamp)
+        """)
+
+        # Small key/value store (detector state survives restarts).
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS kv_state (
+                key TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                updated DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
         """)
 
         await self._connection.commit()
@@ -290,8 +336,7 @@ class LitterRobotDatabase:
         return sorted(list(robot_ids))
     
     async def get_cat_visit_stats(self, robot_id: str, days: int = 30) -> Dict[str, Any]:
-        """Get statistics about cat visits (days counted in America/Los_Angeles)."""
-        # PDT is UTC-7; adjust the cutoff so 'last 14 days' means 14 PDT days
+        """Get statistics about cat visits over the last N days (rolling window)."""
         async with self._connection.execute(
             """
             SELECT cat_name, COUNT(*) as visit_count, 
@@ -300,7 +345,7 @@ class LitterRobotDatabase:
                    MAX(weight_lbs) as max_weight_lbs
             FROM cat_visits 
             WHERE robot_id = ? 
-            AND timestamp > datetime('now', '-7 hours', '-' || ? || ' days')
+            AND timestamp > datetime('now', '-' || ? || ' days')
             GROUP BY cat_name
             """,
             (robot_id, days)
@@ -381,3 +426,94 @@ class LitterRobotDatabase:
         ) as cursor:
             rows = await cursor.fetchall()
             return [row[0] for row in rows]
+
+    # ── Forensics ────────────────────────────────────────────────────────────
+
+    async def store_raw_snapshot(self, robot_id: str, raw: Dict[str, Any], ts: str,
+                                 source: str = "poll", status: Optional[str] = None) -> None:
+        """Store the full raw robot dict. ``ts`` is UTC 'YYYY-MM-DD HH:MM:SS'."""
+        await self._connection.execute(
+            "INSERT INTO raw_snapshots (ts, robot_id, source, status, json) VALUES (?, ?, ?, ?, ?)",
+            (ts, robot_id, source, status, self._serialize_state(raw)),
+        )
+        await self._connection.commit()
+
+    async def get_latest_raw_snapshot(self, robot_id: str) -> Optional[Dict[str, Any]]:
+        async with self._connection.execute(
+            "SELECT ts, source, status, json FROM raw_snapshots WHERE robot_id = ? ORDER BY id DESC LIMIT 1",
+            (robot_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {"ts": row[0], "source": row[1], "status": row[2], "data": json.loads(row[3])}
+
+    async def prune_raw_snapshots(self, keep_days: int) -> int:
+        """Delete raw snapshots older than keep_days. Returns rows deleted."""
+        cursor = await self._connection.execute(
+            "DELETE FROM raw_snapshots WHERE ts < datetime('now', '-' || ? || ' days')",
+            (int(keep_days),),
+        )
+        await self._connection.commit()
+        return cursor.rowcount
+
+    async def store_activities(self, robot_id: str, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Insert activity entries, skipping ones already stored.
+
+        Each entry: {"timestamp": 'YYYY-MM-DD HH:MM:SS' (UTC), "action": str,
+        "action_value": str, "raw": dict|None}. Returns the newly inserted entries.
+        """
+        new = []
+        for e in entries:
+            cursor = await self._connection.execute(
+                """INSERT OR IGNORE INTO activity_history
+                   (robot_id, timestamp, action, action_value, raw_json) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    robot_id, e["timestamp"], str(e["action"]), str(e.get("action_value") or ""),
+                    self._serialize_state(e["raw"]) if e.get("raw") is not None else None,
+                ),
+            )
+            if cursor.rowcount:
+                new.append(e)
+        await self._connection.commit()
+        return new
+
+    async def get_activities(self, robot_id: Optional[str] = None, limit: int = 30) -> List[Dict[str, Any]]:
+        """Most recent stored activity entries, newest first."""
+        query = "SELECT robot_id, timestamp, action, action_value FROM activity_history"
+        params: list = []
+        if robot_id:
+            query += " WHERE robot_id = ?"
+            params.append(robot_id)
+        query += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        params.append(limit)
+        async with self._connection.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                {"robot_id": r[0], "timestamp": r[1], "action": r[2], "action_value": r[3]}
+                for r in rows
+            ]
+
+    async def count_activities(self, robot_id: str) -> int:
+        async with self._connection.execute(
+            "SELECT COUNT(*) FROM activity_history WHERE robot_id = ?", (robot_id,)
+        ) as cursor:
+            return (await cursor.fetchone())[0]
+
+    async def get_kv(self, key: str) -> Optional[Any]:
+        async with self._connection.execute("SELECT json FROM kv_state WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            try:
+                return json.loads(row[0])
+            except ValueError:
+                return None
+
+    async def set_kv(self, key: str, value: Any) -> None:
+        await self._connection.execute(
+            """INSERT INTO kv_state (key, json, updated) VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated = excluded.updated""",
+            (key, json.dumps(value, default=str)),
+        )
+        await self._connection.commit()
