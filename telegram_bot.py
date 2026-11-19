@@ -1,13 +1,29 @@
 """Telegram bot command handler for Litter Robot Monitor."""
 import asyncio
+import contextvars
+import html
 import logging
 import io
 import os
-from typing import Dict, Any, Optional, Callable
+import time
+from typing import Dict, Any, Iterable, Optional, Callable
 import aiohttp
 
-from monitor import LitterRobotMonitor, STATUS_CODES
+from status_codes import STATUS_CODES
 from database import LitterRobotDatabase
+from timeutil import DEFAULT_TZ, fmt_duration, fmt_local, to_local
+
+# Chat the command currently being handled came from; replies go back there.
+_reply_chat: contextvars.ContextVar = contextvars.ContextVar("reply_chat", default=None)
+
+POLL_BACKOFF_BASE = 2.0
+POLL_BACKOFF_MAX = 120.0
+POLL_FAILURE_SUMMARY_SECONDS = 1800.0
+
+
+def poll_backoff(failures: int) -> float:
+    """Seconds to wait after N consecutive polling failures (2, 4, 8 ... 120)."""
+    return min(POLL_BACKOFF_MAX, POLL_BACKOFF_BASE * (2 ** max(0, failures - 1)))
 
 # Plotting imports
 try:
@@ -24,9 +40,13 @@ except ImportError:
 class TelegramBot:
     """Handles Telegram bot commands for querying Litter Robot status."""
     
-    def __init__(self, bot_token: str, chat_id: str, monitor: LitterRobotMonitor, db: LitterRobotDatabase):
+    def __init__(self, bot_token: str, chat_id: str, monitor: Any, db: LitterRobotDatabase,
+                 authorized_user_ids: Optional[Iterable] = None, tz_name: str = DEFAULT_TZ):
         self.bot_token = bot_token
         self.chat_id = str(chat_id)
+        # Users whose *direct messages* to the bot are answered too (empty = group only).
+        self.authorized_user_ids = {str(u) for u in (authorized_user_ids or [])}
+        self.tz_name = tz_name
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         self.monitor = monitor
         self.db = db
@@ -42,12 +62,38 @@ class TelegramBot:
         self.logger.info("Telegram bot started - listening for commands")
         # Silent startup - no message sent
         
+        # Network blips are normal: back off exponentially and log one warning
+        # when trouble starts, a summary every 30 min, and one line on recovery
+        # — instead of an ERROR per attempt.
+        failures = 0
+        first_failure = 0.0
+        last_summary = 0.0
         while self._running:
             try:
                 await self._poll_updates()
+                if failures:
+                    self.logger.info(
+                        f"Telegram polling recovered after {failures} failed attempt(s) "
+                        f"over {fmt_duration(time.time() - first_failure)}"
+                    )
+                    failures = 0
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                self.logger.error(f"Error polling Telegram: {e}")
-            await asyncio.sleep(1)
+                now = time.time()
+                failures += 1
+                reason = f"{type(e).__name__}: {str(e).replace(self.bot_token, '<token>')}"
+                if failures == 1:
+                    first_failure = last_summary = now
+                    self.logger.warning(f"Telegram polling failed ({reason}) — retrying with backoff")
+                elif now - last_summary >= POLL_FAILURE_SUMMARY_SECONDS:
+                    last_summary = now
+                    self.logger.warning(
+                        f"Telegram polling still failing: {failures} attempts over "
+                        f"{fmt_duration(now - first_failure)} (last: {reason})"
+                    )
+                await asyncio.sleep(poll_backoff(failures))
     
     async def run_forever(self) -> None:
         """Alias for start() — fits the watchdog scheduler interface."""
@@ -69,13 +115,15 @@ class TelegramBot:
             }
             
             try:
-                async with session.get(url, params=params, timeout=35) as response:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=40)) as response:
                     if response.status != 200:
-                        return
+                        # e.g. 409 (another poller on this token), 429, 5xx -> back off
+                        body = (await response.text())[:200]
+                        raise RuntimeError(f"getUpdates HTTP {response.status}: {body}")
                     
                     data = await response.json()
                     if not data.get("ok"):
-                        return
+                        raise RuntimeError(f"getUpdates not ok: {str(data)[:200]}")
                     
                     for update in data.get("result", []):
                         self._offset = update.get("update_id", 0) + 1
@@ -101,18 +149,29 @@ class TelegramBot:
         
         message = update.get("message") or update.get("edited_message")
         if not message:
+            self.logger.info(f"Ignoring update {update_id}: no message (keys={list(update.keys())})")
             return
         
         chat = message.get("chat", {})
         chat_id = str(chat.get("id"))
         
-        # Only respond to authorized chat
-        if chat_id != self.chat_id:
+        # Respond to the configured group chat, and to direct messages from
+        # explicitly authorized users (telegram.authorized_user_ids).
+        if not self._is_authorized(message):
+            sender = message.get("from", {}) or {}
+            self.logger.info(
+                f"Ignoring update {update_id}: chat {chat_id} ({chat.get('type')} '{chat.get('title') or chat.get('username')}') "
+                f"is not the configured chat {self.chat_id} and user {sender.get('id')} is not in "
+                f"authorized_user_ids; text={message.get('text', '')[:30]!r}"
+            )
             return
         
         text = message.get("text", "")
         if not text:
+            self.logger.info(f"Ignoring update {update_id}: message has no text")
             return
+        if not text.startswith("/"):
+            return  # ordinary chat message, not a command
         
         # Parse command
         cmd_parts = text.strip().split()
@@ -144,57 +203,80 @@ class TelegramBot:
             "/history": self.cmd_history,
             "/issues": self.cmd_issues,
             "/full": self.cmd_full_report,
+            "/activity": self.cmd_activity,
+            "/ack": self.cmd_ack,
         }
         
         handler = handlers.get(cmd)
+        self.logger.info(f"Command {cmd!r} from chat {chat_id} -> {'handler' if handler else 'no handler'}")
         if handler:
+            # Replies go to the chat the command came from (group or authorized DM).
+            token = _reply_chat.set(chat_id)
             try:
                 await handler()
             except Exception as e:
                 self.logger.error(f"Command {cmd} failed: {e}", exc_info=True)
-                await self.send_message(f"❌ Command failed: <code>{e}</code>")
-    
-    async def send_message(self, message: str) -> bool:
-        """Send a message to the chat."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.base_url}/sendMessage"
-                payload = {
-                    "chat_id": self.chat_id,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_notification": False
-                }
-                
-                async with session.post(url, json=payload) as response:
-                    return response.status == 200
-                        
-        except Exception as e:
-            self.logger.error(f"Failed to send message: {e}")
-            return False
-    
-    async def send_photo(self, photo_bytes: bytes, caption: str = "") -> bool:
-        """Send a photo to the chat."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.base_url}/sendPhoto"
-                
-                data = aiohttp.FormData()
-                data.add_field('chat_id', self.chat_id)
-                data.add_field('photo', photo_bytes, filename='chart.png', content_type='image/png')
-                if caption:
-                    data.add_field('caption', caption)
-                    data.add_field('parse_mode', 'HTML')
-                
-                async with session.post(url, data=data) as response:
-                    if response.status != 200:
+                await self.send_message(f"❌ Command failed: <code>{html.escape(str(e))}</code>")
+            finally:
+                _reply_chat.reset(token)
+
+    def _is_authorized(self, message: Dict[str, Any]) -> bool:
+        """Configured group chat, or a private chat with an authorized user."""
+        chat = message.get("chat", {}) or {}
+        if str(chat.get("id")) == self.chat_id:
+            return True
+        sender_id = str((message.get("from") or {}).get("id"))
+        return chat.get("type") == "private" and sender_id in self.authorized_user_ids
+
+    def _target_chat(self, chat_id: Optional[str] = None) -> str:
+        return str(chat_id or _reply_chat.get() or self.chat_id)
+
+    async def _post_with_retry(self, method: str, make_kwargs: Callable[[], dict], what: str) -> bool:
+        """POST to the Bot API, retrying network errors / 429 / 5xx a few times."""
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                    async with session.post(f"{self.base_url}/{method}", **make_kwargs()) as response:
+                        if response.status == 200:
+                            return True
                         text = await response.text()
-                        self.logger.error(f"Failed to send photo: {response.status} - {text}")
-                    return response.status == 200
-                        
-        except Exception as e:
-            self.logger.error(f"Failed to send photo: {e}")
-            return False
+                        self.logger.error(f"Failed to send {what}: {response.status} - {text[:300]}")
+                        if response.status != 429 and response.status < 500:
+                            return False  # bad request: retrying won't help
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                reason = f"{type(e).__name__}: {str(e).replace(self.bot_token, '<token>')}"
+                self.logger.warning(f"Failed to send {what} (attempt {attempt}/{attempts}): {reason}")
+            if attempt < attempts:
+                await asyncio.sleep(2 * attempt)
+        return False
+
+    async def send_message(self, message: str, chat_id: Optional[str] = None) -> bool:
+        """Send a message to the chat the current command came from (default: the group)."""
+        payload = {
+            "chat_id": self._target_chat(chat_id),
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_notification": False
+        }
+        return await self._post_with_retry("sendMessage", lambda: {"json": payload}, "message")
+    
+    async def send_photo(self, photo_bytes: bytes, caption: str = "", chat_id: Optional[str] = None) -> bool:
+        """Send a photo to the chat the current command came from (default: the group)."""
+        target = self._target_chat(chat_id)
+
+        def make_kwargs() -> dict:
+            data = aiohttp.FormData()  # a FormData can only be sent once -> rebuild per attempt
+            data.add_field('chat_id', target)
+            data.add_field('photo', photo_bytes, filename='chart.png', content_type='image/png')
+            if caption:
+                data.add_field('caption', caption)
+                data.add_field('parse_mode', 'HTML')
+            return {"data": data}
+
+        return await self._post_with_retry("sendPhoto", make_kwargs, "photo")
     
     async def cmd_start(self) -> None:
         """Handle /start command."""
@@ -216,6 +298,8 @@ class TelegramBot:
             "<code>/cats</code> - Cat weights and last visits\n"
             "<code>/shit</code> - Drawer emptying history & frequency\n"
             "<code>/history</code> - Recent activity history\n"
+            "<code>/activity</code> - Last robot events (our local copy of the Whisker feed)\n"
+            "<code>/ack</code> - Silence reminder repeats for active alerts\n"
             "<code>/full</code> - Complete detailed report\n"
             "<code>/help</code> - Show this help message"
         )
@@ -252,13 +336,22 @@ class TelegramBot:
             
             # Problem status codes that block operation
             problem_statuses = {
-                "BR": "🚨 <b>Bonnet Removed</b> - Reattach the bonnet",
-                "CSF": "⚠️ <b>Cat Sensor Fault</b> - Check sensor",
-                "CSI": "⚠️ <b>Cat Sensor Interrupted</b> - Cycle was interrupted",
-                "DFS": "🗑️ <b>Drawer Full</b> - Empty the waste drawer",
+                "BONNET_REMOVED": "🚨 <b>Bonnet Removed</b> - Reattach the bonnet",
+                "CAT_SENSOR_FAULT": "⚠️ <b>Cat Sensor Fault</b> - Check sensor",
+                "STARTUP_CAT_SENSOR_FAULT": "⚠️ <b>Cat Sensor Fault</b> - Check sensor",
+                "CAT_SENSOR_INTERRUPTED": "⚠️ <b>Cat Sensor Interrupted</b> - Cycle was interrupted",
                 "DRAWER_FULL": "🗑️ <b>Drawer Full</b> - Empty the waste drawer",
+                "STARTUP_DRAWER_FULL": "🗑️ <b>Drawer Full</b> - Empty the waste drawer",
                 "OFF": "⏸️ <b>Unit is Off</b> - Turn on to resume operation",
-                "P": "⏸️ <b>Unit is Paused</b> - Unpause to resume",
+                "OFFLINE": "📡 <b>Unit is Offline</b> - Check power / Wi-Fi",
+                "PAUSED": "⏸️ <b>Unit is Paused</b> - Unpause to resume",
+                "PINCH_DETECT": "🚨 <b>Pinch Detected</b> - Check the globe",
+                "STARTUP_PINCH_DETECT": "🚨 <b>Pinch Detected</b> - Check the globe",
+                "OVER_TORQUE_FAULT": "🚨 <b>Over Torque Fault</b> - Globe is jammed or overloaded",
+                "DUMP_POSITION_FAULT": "🚨 <b>Dump Position Fault</b> - Globe could not reach dump position",
+                "HOME_POSITION_FAULT": "🚨 <b>Home Position Fault</b> - Globe could not return home",
+                "DUMP_HOME_POSITION_FAULT": "🚨 <b>Dump + Home Position Fault</b> - Check the globe",
+                "EMPTY_CYCLE": "🚨 <b>Empty Cycle</b> - The robot is emptying ALL litter",
             }
             
             if status in problem_statuses:
@@ -269,6 +362,23 @@ class TelegramBot:
                 issues.append(f"🗑️ <b>Critical Waste Level</b> - Drawer at {waste}%! Empty now.")
             elif waste and waste >= 80:
                 issues.append(f"⚡ <b>Drawer Getting Full</b> - At {waste}%, plan to empty soon.")
+            
+            for label, value in (("Globe motor fault", state.get("globe_motor_fault")),
+                                 ("Globe retract fault", state.get("globe_motor_retract_fault")),
+                                 ("USB fault", state.get("usb_fault"))):
+                if value not in (None, "", "NONE", "FAULT_CLEAR", "CLEAR"):
+                    issues.append(f"🚨 <b>{label}</b> - <code>{value}</code>")
+            if hasattr(self.monitor, "active_incidents"):
+                for key, inc in self.monitor.active_incidents().items():
+                    if not key.startswith(f"{state.get('name')}: "):
+                        continue
+                    age = fmt_duration(time.time() - inc.get("since", time.time()))
+                    detail = "; ".join(inc.get("reasons", []))
+                    issues.append(
+                        f"🚨 <b>Active alert: {html.escape(key.split(': ', 1)[1])}</b> for {age}"
+                        + (f" ({html.escape(detail)})" if detail else "")
+                        + (" <i>[acknowledged]</i>" if inc.get("acked") else "")
+                    )
             
             # Add issues section if any found
             if issues:
@@ -360,7 +470,7 @@ class TelegramBot:
                 """Plot all visits for a cat."""
                 if not cat_visits:
                     return
-                dates = [datetime.fromisoformat(v['timestamp']) for v in cat_visits]
+                dates = [to_local(v['timestamp'], self.tz_name).replace(tzinfo=None) for v in cat_visits]
                 weights = [v['weight_lbs'] for v in cat_visits]
 
                 ax.plot(dates, weights, f'{marker}-', color=color,
@@ -457,25 +567,20 @@ class TelegramBot:
                             f"avg {s['avg_weight_lbs']:.1f} lbs"
                         )
             
-            # Last seen per cat (in PDT)
+            # Last seen per cat (local time, correct PST/PDT label)
             last_seen_info = await self.db.get_last_visit_per_cat(robot_id)
             if last_seen_info:
                 message_parts.append("")
-                from datetime import timezone, timedelta
-                pdt = timezone(timedelta(hours=-7))
                 for cat_name in ['PIXEL', 'CHICKA']:
                     if cat_name in last_seen_info:
                         info = last_seen_info[cat_name]
                         ts_utc = info['timestamp']
                         try:
-                            from datetime import datetime as dt
-                            ts = dt.strptime(ts_utc[:19], '%Y-%m-%d %H:%M:%S')
-                            ts = ts.replace(tzinfo=timezone.utc).astimezone(pdt)
-                            time_str = ts.strftime('%b %d, %I:%M %p')
+                            time_str = fmt_local(ts_utc, '%b %d, %I:%M %p %Z', self.tz_name)
                         except Exception:
-                            time_str = ts_utc
+                            time_str = f"{ts_utc} UTC"
                         message_parts.append(
-                            f"🐈 <b>{cat_name}:</b> {info['weight_lbs']:.1f} lbs — {time_str} PDT"
+                            f"🐈 <b>{cat_name}:</b> {info['weight_lbs']:.1f} lbs — {time_str}"
                         )
             
             # Generate and send plot if we have visit data
@@ -501,8 +606,7 @@ class TelegramBot:
 
     async def cmd_shit(self) -> None:
         """Handle /shit command - drawer full history & frequency."""
-        from datetime import datetime as dt, timezone, timedelta
-        pdt = timezone(timedelta(hours=-7))
+        from datetime import datetime as dt
 
         robot_ids = await self.db.get_distinct_robot_ids()
         if not robot_ids:
@@ -518,15 +622,14 @@ class TelegramBot:
 
         lines = ["💩 <b>Drawer Full History</b>", ""]
         lines.append("<pre>")
-        lines.append(f"{'Date':<14}{'Days':>5}")
-        lines.append(f"{'-'*14}{'-'*5}")
+        lines.append(f"{'Date':<18}{'Days':>5}")
+        lines.append(f"{'-'*18}{'-'*5}")
 
         prev_ts = None
         # Reverse to show oldest first
         for ts_str in reversed(full_dates):
             try:
-                ts = dt.strptime(ts_str[:19], '%Y-%m-%d %H:%M:%S')
-                ts = ts.replace(tzinfo=timezone.utc).astimezone(pdt)
+                ts = to_local(ts_str[:19], self.tz_name)
             except Exception:
                 continue
 
@@ -536,7 +639,7 @@ class TelegramBot:
             else:
                 days_str = "—"
 
-            lines.append(f"{ts.strftime('%b %d %H:%M'):<14}{days_str:>5}")
+            lines.append(f"{ts.strftime('%b %d %H:%M %Z'):<18}{days_str:>5}")
             prev_ts = ts
 
         lines.append("</pre>")
@@ -588,7 +691,10 @@ class TelegramBot:
             if waste_readings:
                 message_parts.append("\n<b>Recent Waste Levels:</b>")
                 for row in waste_readings[:3]:
-                    ts = row.get("timestamp", "")[11:16]  # Just HH:MM
+                    try:
+                        ts = fmt_local(row.get("timestamp", ""), "%H:%M %Z", self.tz_name)
+                    except Exception:
+                        ts = row.get("timestamp", "")[11:16] + " UTC"
                     waste = row.get("waste_drawer_level")
                     message_parts.append(f"  • {ts}: {waste}%")
             
@@ -606,13 +712,17 @@ class TelegramBot:
         
         for robot_id, robot in self.monitor.robots.items():
             state = self.monitor._get_state_dict(robot)
+            litter = state.get('litter_level')
+            litter_str = f"{litter:.0f}%" if isinstance(litter, (int, float)) else "Unknown"
             
             message_parts = [
                 f"📋 <b>Complete Report: {state['name']}</b>",
                 "",
                 f"<b>Status:</b> {state.get('status')} - {state.get('status_description')}",
                 f"🗑️ Waste Level: {state.get('waste_drawer_level', 'Unknown')}%",
-                f"🌿 Litter Level: {state.get('litter_level', 'Unknown'):.0f}% ({state.get('litter_level_state', 'Unknown')})",
+                f"🌿 Litter Level: {litter_str} ({state.get('litter_level_state', 'Unknown')})",
+                f"⚙️ Globe motor: {state.get('globe_motor_fault', 'Unknown')} / retract {state.get('globe_motor_retract_fault', 'Unknown')}",
+                f"🔢 Empty cycles: {state.get('empty_cycles', 'Unknown')}",
                 f"⚡ Power: {state.get('power_status', 'Unknown')}",
                 f"💡 Night Light: {'On' if state.get('nightlight_status') else 'Off'}",
                 f"🔒 Panel Lock: {'Locked' if state.get('panel_locked') else 'Unlocked'}",
@@ -645,12 +755,47 @@ class TelegramBot:
             
             last_seen = state.get('last_seen')
             if last_seen:
+                try:
+                    last_seen = fmt_local(last_seen, '%b %d %Y, %I:%M %p %Z', self.tz_name)
+                except Exception:
+                    pass
                 message_parts.append(f"📅 Last Seen: {last_seen}")
             
             # Add any warnings
             status = state.get("status", "")
-            if status in ["BR", "CSF", "CSI", "DFS", "DRAWER_FULL", "OFF", "P"]:
+            if STATUS_CODES.get(status, ("", ""))[1] in ("error", "warning", "inactive"):
                 message_parts.append("")
                 message_parts.append(f"⚠️ <b>WARNING:</b> {state.get('status_description')}")
             
             await self.send_message("\n".join(message_parts))
+
+    async def cmd_activity(self) -> None:
+        """Handle /activity - last robot events from our local copy of the Whisker feed."""
+        entries = await self.db.get_activities(limit=25)
+        if not entries:
+            await self.send_message("📜 No activity stored yet.")
+            return
+        lines = ["📜 <b>Recent robot activity</b> (newest first)", "<pre>"]
+        for e in entries:
+            try:
+                ts = fmt_local(e["timestamp"], "%b %d %H:%M:%S %Z", self.tz_name)
+            except Exception:
+                ts = f"{e['timestamp']} UTC"
+            value = f" = {e['action_value']}" if e.get("action_value") else ""
+            lines.append(html.escape(f"{ts}  {e['action']}{value}"))
+        lines.append("</pre>")
+        await self.send_message("\n".join(lines))
+
+    async def cmd_ack(self) -> None:
+        """Handle /ack - stop reminder repeats for the currently active alerts."""
+        if not hasattr(self.monitor, "acknowledge_incidents"):
+            await self.send_message("Nothing to acknowledge.")
+            return
+        acked = await self.monitor.acknowledge_incidents()
+        if acked:
+            await self.send_message(
+                "🔕 Acknowledged: <code>" + html.escape(", ".join(acked)) + "</code>\n"
+                "<i>No more reminders for these; new evidence will alert again.</i>"
+            )
+        else:
+            await self.send_message("✅ No active alerts to acknowledge.")
