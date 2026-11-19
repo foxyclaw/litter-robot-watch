@@ -3,7 +3,7 @@
 
 LAUNCHD_DIR="$HOME/Library/LaunchAgents"
 PLIST_NAME="com.litterrobot.monitor.plist"
-PLIST_SRC="/Users/foxyclaw/.openclaw/workspace/watchdog_services/$PLIST_NAME"
+PLIST_SRC="/Users/foxyclaw/openclaw_projects/watchdog_services/$PLIST_NAME"
 PLIST_DEST="$LAUNCHD_DIR/$PLIST_NAME"
 
 echo "Installing Litter Robot Monitor service (user-level)..."
@@ -38,7 +38,7 @@ echo "This service will start automatically when you log in to the Mac."
 echo ""
 echo "Commands:"
 echo "  Check status: launchctl list | grep litterrobot"
-echo "  View logs:    tail -f /Users/foxyclaw/.openclaw/workspace/watchdog_services/daemon.log"
+echo "  View logs:    tail -f /Users/foxyclaw/openclaw_projects/watchdog_services/daemon.log"
 echo "  Stop:         launchctl stop com.litterrobot.monitor"
 echo "  Restart:      launchctl kickstart -k gui/$(id -u)/com.litterrobot.monitor"
 echo "  Uninstall:    launchctl unload $PLIST_DEST && rm $PLIST_DEST"

@@ -24,16 +24,23 @@ class TelegramCommandBot:
 
     async def run_forever(self) -> None:
         self.logger.info("Telegram bot polling started")
+        failures = 0
         while True:
             try:
                 updates = await self._get_updates()
+                if failures:
+                    self.logger.info(f"Bot polling recovered after {failures} failed attempt(s)")
+                    failures = 0
                 for update in updates:
                     await self._handle_update(update)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.logger.error(f"Bot polling error: {e}")
-                await asyncio.sleep(5)
+                failures += 1
+                if failures == 1:  # one warning per outage, not one error per attempt
+                    reason = str(e).replace(self.bot_token, "<token>")
+                    self.logger.warning(f"Bot polling failed ({type(e).__name__}: {reason}) — retrying with backoff")
+                await asyncio.sleep(min(120, 2 * 2 ** min(failures - 1, 6)))
 
     async def _get_updates(self):
         params = {"offset": self._offset, "timeout": 30, "allowed_updates": ["message"]}
@@ -44,6 +51,8 @@ class TelegramCommandBot:
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=40),
                 ) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"getUpdates HTTP {resp.status}")
                     data = await resp.json()
                     updates = data.get("result", [])
                     if updates:
