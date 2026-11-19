@@ -6,7 +6,7 @@ from pylitterbot import Account
 
 async def main():
     # Load config
-    with open('/Users/foxyclaw/.openclaw/workspace/watchdog_services/config.yaml') as f:
+    with open('/Users/foxyclaw/openclaw_projects/watchdog_services/config.yaml') as f:
         config = yaml.safe_load(f)
     
     account = Account()

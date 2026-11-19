@@ -2,7 +2,7 @@
 # Install Litter Robot Monitor as a system LaunchDaemon (runs at boot)
 
 PLIST_NAME="com.litterrobot.monitor.plist"
-PLIST_SRC="/Users/foxyclaw/.openclaw/workspace/watchdog_services/$PLIST_NAME"
+PLIST_SRC="/Users/foxyclaw/openclaw_projects/watchdog_services/$PLIST_NAME"
 PLIST_DEST="/Library/LaunchDaemons/$PLIST_NAME"
 
 echo "Installing Litter Robot Monitor as system service..."
@@ -36,7 +36,7 @@ sudo launchctl list | grep litterrobot
 echo ""
 echo "Commands:"
 echo "  Check status: sudo launchctl list | grep litterrobot"
-echo "  View logs:    tail -f /Users/foxyclaw/.openclaw/workspace/watchdog_services/daemon.log"
+echo "  View logs:    tail -f /Users/foxyclaw/openclaw_projects/watchdog_services/daemon.log"
 echo "  Stop:         sudo launchctl stop com.litterrobot.monitor"
 echo "  Restart:      sudo launchctl kickstart -k system/com.litterrobot.monitor"
 echo "  Uninstall:    sudo launchctl unload $PLIST_DEST && sudo rm $PLIST_DEST"

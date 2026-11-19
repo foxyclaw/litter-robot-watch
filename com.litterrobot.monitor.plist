@@ -7,13 +7,13 @@
     
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/venv/bin/python</string>
-        <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/main.py</string>
+        <string>/Users/foxyclaw/openclaw_projects/watchdog_services/venv/bin/python</string>
+        <string>/Users/foxyclaw/openclaw_projects/watchdog_services/main.py</string>
         <string>daemon</string>
     </array>
     
     <key>WorkingDirectory</key>
-    <string>/Users/foxyclaw/.openclaw/workspace/litter_monitor</string>
+    <string>/Users/foxyclaw/openclaw_projects/litter_monitor</string>
     
     <key>UserName</key>
     <string>foxyclaw</string>
@@ -21,7 +21,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/foxyclaw/openclaw_projects/watchdog_services/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>/Users/foxyclaw</string>
     </dict>
@@ -36,10 +36,10 @@
     <integer>30</integer>
     
     <key>StandardOutPath</key>
-    <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/daemon.log</string>
+    <string>/Users/foxyclaw/openclaw_projects/watchdog_services/daemon.log</string>
     
     <key>StandardErrorPath</key>
-    <string>/Users/foxyclaw/.openclaw/workspace/watchdog_services/daemon.error.log</string>
+    <string>/Users/foxyclaw/openclaw_projects/watchdog_services/daemon.error.log</string>
     
     <key>ProcessType</key>
     <string>Background</string>
