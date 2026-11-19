@@ -10,3 +10,8 @@ __pycache__/
 stock_price_state.json
 .env
 .DS_Store
+data/
+*.bak*
+*.jsonl
+*.jsonl.gz
+.pytest_cache/

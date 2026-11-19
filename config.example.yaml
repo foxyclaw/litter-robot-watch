@@ -5,6 +5,9 @@
 telegram:
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
   chat_id: "YOUR_TELEGRAM_CHAT_ID"
+  # Telegram user IDs whose direct messages to the bot are also answered
+  # (replies go to the chat the command came from). Empty = group chat only.
+  authorized_user_ids: []
 
 # Logging
 logging:
@@ -24,6 +27,19 @@ checks:
         password: "YOUR_WHISKER_PASSWORD"
       database: "/path/to/litter-robot-watch/litter_robot.db"
       # telegram: omitted → falls back to global bot above
+      # Local time zone for all displayed times (correct PST/PDT handling)
+      timezone: "America/Los_Angeles"
+      # Forensic logging: full raw snapshot every poll -> SQLite (raw_snapshots)
+      # + daily JSONL files; activity feed copied to SQLite (activity_history)
+      forensics:
+        jsonl_dir: "data"               # relative to the project dir, gitignored
+        retention_days: 90              # raw snapshots (DB + JSONL) older than this are deleted
+        activity_interval_seconds: 300  # how often to copy the Whisker activity feed
+      # Capture transient states
+      realtime:
+        websocket: true                 # Whisker push updates; polling continues regardless
+        fast_poll_interval_seconds: 30  # poll this fast while a cycle / fault is in progress
+        fast_poll_hold_seconds: 300     # ... and for this long afterwards
       alerts:
         waste_levels:
           - "DF1"
@@ -32,6 +48,22 @@ checks:
           - "DRAWER_FULL"
         waste_threshold: 90
         waste_repeat_seconds: 10800  # repeat waste alert at most every 3h
+        # ── Litter-dump detection ("all the litter ended up in the drawer") ──
+        dump_waste_jump_points: 25      # waste % steps up by >= this ...
+        dump_window_seconds: 900        # ... within this window (15 min)
+        dump_confirm_seconds: 300       # ... and stays there this long (0 = alert at once)
+        dump_litter_drop_points: 25     # or litter level % steps down by >= this
+        dump_max_gap_seconds: 21600     # don't compare readings further apart than this
+        dump_ignore_zero_baseline: true # 0% right after emptying the drawer is not a baseline
+        dump_repeat_seconds: 3600       # remind every hour until resolved or /ack
+        dump_max_alert_seconds: 86400   # stop reminding after a day
+        # ── Litter level state ──
+        litter_low_states: ["LOW", "REFILL", "EMPTY"]
+        litter_low_repeat_seconds: 86400
+        # ── Faults (globe motor, retract, pinch, USB, error statuses, offline) ──
+        fault_repeat_seconds: 3600      # remind every hour until resolved or /ack
+        offline_minutes: 30             # robot offline / Whisker cloud unreachable for this long
+        status_grace_seconds: 600       # bonnet removed / paused / off must persist this long
         error_statuses:
           - "CSF"
           - "BR"
