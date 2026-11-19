@@ -18,8 +18,8 @@ silenced with `/ack`.
 
 | Alert | Trigger | Repeat |
 |-------|---------|--------|
-| 🚨 **Litter missing / dumped** | Any of: litter level steps down by ≥ `dump_litter_drop_points` (25) — *stage 1: litter missing from the globe or globe not level* · waste-drawer level steps up by ≥ `dump_waste_jump_points` (25) within `dump_window_seconds` (15 min) — *stage 2: litter dumped into the drawer* · the empty-cycle odometer increments · an `EMPTY_CYCLE` status is seen · litter-level state becomes `EMPTY`. A step must persist for `dump_confirm_seconds` (5 min), except right after a globe fault or when the incident is already open | every `dump_repeat_seconds` (1 h) for up to `dump_max_alert_seconds` (24 h). Clears only when the litter is back: level state no longer low, or litter ≥ `dump_resolve_litter_percent` (80 %) on an at-rest reading. Emptying the waste drawer does **not** clear it (logged only) |
-| ⚠️ Litter low | litter-level state in `litter_low_states` (LOW / REFILL / EMPTY). Suppressed while a litter-dump incident is open and not yet `/ack`ed (it would repeat the same news); takes over after `/ack` or the 24 h cap if the litter is still low | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
+| 🚨 **Litter missing / dumped** | Any of: litter level steps down by ≥ `dump_litter_drop_points` (25) — *stage 1: litter missing from the globe or globe not level* · waste-drawer level steps up by ≥ `dump_waste_jump_points` (25) within `dump_window_seconds` (15 min) — *stage 2: litter dumped into the drawer* · the empty-cycle odometer increments · an `EMPTY_CYCLE` status is seen · litter-level state becomes `EMPTY`. A step must persist for `dump_confirm_seconds` (5 min), except right after a globe fault or when the incident is already open | every `dump_repeat_seconds` (1 h) for up to `dump_max_alert_seconds` (24 h). Clears only when the litter is back: level state no longer low, or litter ≥ `dump_resolve_litter_percent` (80 %) on an at-rest reading. Emptying the waste drawer does **not** clear it (logged only) — except an incident opened by a drawer jump **alone** (litter never read low, no litter drop, no globe fault, no empty-cycle evidence): that one is treated as drawer-sensor noise and also clears when the drawer reading drops back |
+| ⚠️ Litter low | litter-level state in `litter_low_states` (LOW / REFILL / EMPTY). Suppressed while a litter-dump incident is open and not yet `/ack`ed (it would repeat the same news); takes over after `/ack` or the 24 h cap if the litter is still low. At or below `litter_empty_percent` (45 %) the text adds "globe looks EMPTY" (see [Litter level sensor notes](#litter-level-sensor-notes)) | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
 | 🚨 Globe motor fault / retract fault | status ≠ `FAULT_CLEAR` | every `fault_repeat_seconds` (1 h) |
 | 🚨 Pinch detected | pinch status / pinch fault reported | 1 h |
 | ⚠️ USB fault | `USBFaultStatus` ≠ `CLEAR` | 1 h |
@@ -32,8 +32,9 @@ replay in `tests/test_incident_20261119.py`), and the alert says which one it is
 "Into the drawer" is only ever claimed once the drawer level has jumped:
 
 > 🚨 **COPTiP**: litter level dropped 90%→40% after a failed cycle — litter missing
-> from the globe or globe not level. Do NOT let it cycle again until checked (the
-> next cycle tends to dump the litter into the drawer). [waste drawer unchanged at 16%]
+> from the globe or globe not level. Litter level 40% — globe looks EMPTY (empty
+> globe reads ~32%). Do NOT let it cycle again until checked (the next cycle tends
+> to dump the litter into the drawer). [waste drawer unchanged at 16%]
 
 > 🚨 **COPTiP**: litter dumped into the waste drawer (litter level 90%→40% in 2 min;
 > waste drawer 16%→75% in 2 min). The globe is probably empty. Check the globe has litter!
@@ -86,6 +87,36 @@ Alert delivery is queued: if Telegram is unreachable the message is retried
 with exponential backoff (5 s … 5 min, for up to 24 h) and the queue is kept in
 `data/telegram_outbox*.json` so it survives a restart. Late messages are marked
 "delayed N min".
+
+## Litter level sensor notes
+
+**An empty Litter-Robot 4 globe does not read 0 %.** The litter level is derived
+from a TOF distance reading (`litterLevel`, in mm), and with no litter in the
+globe the reported percentage is still well above zero. Calibration by the owner on 2026-11-19, right after a deep clean:
+
+| Globe | `litterLevelPercentage` | `litterLevel` (TOF, mm) | `litterLevelState` |
+|-------|------------------------|-------------------------|--------------------|
+| completely **EMPTY** (no litter at all) | **32 %** | ~484 | `REFILL` (not `EMPTY`!) |
+| normal, full | 90 % | ~426–430 (`optimalLitterLevel` 450) | `OPTIMAL` |
+| earlier dump events | 16–22 % | — | `EMPTY` |
+
+What follows from that:
+
+- The floor is **not fixed**: an empty globe has read anything from 16 % to
+  32 % (why it varies is not known). The
+  robot's own `EMPTY` state is not reliable either — the emptiest globe we have
+  measured reported `REFILL`.
+- A reading of 30–40 % does **not** mean "a third of the litter is left". Treat
+  anything at or below `alerts.litter_empty_percent` (default 45) as empty; the
+  stage-1 dump alert and the litter-low alert then say so:
+  `litter level 40% — globe looks EMPTY (empty globe reads ~32%)`.
+  Set it to 0 to switch that wording off.
+- A larger TOF distance means *less* litter (484 mm empty vs ~428 mm full): the
+  whole usable range is only about 55 mm, so a few millimetres are several
+  percentage points.
+- `dump_litter_drop_points` (25) still works with this floor: full → empty is a
+  drop of roughly 58–74 points. `dump_resolve_litter_percent` (80) is far above
+  any empty reading, so an empty globe can never clear a dump incident.
 
 ## What is logged where
 
@@ -195,6 +226,7 @@ credentials) and edit it. Keys of the `litter_robot` check:
 | `config.alerts.dump_repeat_seconds` | 3600 | dump reminder interval |
 | `config.alerts.dump_max_alert_seconds` | 86400 | stop dump reminders after this long |
 | `config.alerts.dump_resolve_litter_percent` | 80 | litter % that clears a dump incident (or a non-low level state) |
+| `config.alerts.litter_empty_percent` | 45 | litter % at or below which alerts say "globe looks EMPTY" (an empty globe reads ~32 %, not 0; 0 = off) |
 | `config.alerts.litter_low_states` | LOW, REFILL, EMPTY | litter states that alert |
 | `config.alerts.litter_low_repeat_seconds` | 86400 | litter-low reminder interval |
 | `config.alerts.fault_repeat_seconds` | 3600 | fault / offline reminder interval |

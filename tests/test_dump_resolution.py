@@ -120,14 +120,84 @@ def test_resolves_on_configurable_percent_or_non_low_state_and_only_at_rest():
     assert DetectionConfig.from_config({"dump_resolve_litter_percent": 65}).dump_resolve_litter_percent == 65
 
 
-def test_drawer_only_incident_with_litter_never_seen_low_is_not_auto_resolved():
-    """Litter reads OPTIMAL all along: there is nothing to "restore", so neither
-    that reading nor the emptied drawer closes the incident (/ack or the cap do)."""
-    det = Detector("COPTiP", DetectionConfig())
+def drawer_only(det, **extra):
+    """Drawer 16% -> 75% while the litter reads 90% OPTIMAL throughout."""
     feed(det, 0, DFILevelPercent=16)
-    feed(det, 5 * MIN, DFILevelPercent=75)
-    assert keys(feed(det, 10 * MIN, DFILevelPercent=75)) == [("litter_dump", "new")]
-    assert feed(det, 15 * MIN, DFILevelPercent=75) == []
+    feed(det, 5 * MIN, DFILevelPercent=75, **extra)
+    assert keys(feed(det, 10 * MIN, DFILevelPercent=75, **extra)) == [("litter_dump", "new")]
+
+
+def test_drawer_jump_only_incident_resolves_when_the_drawer_reading_drops_back():
+    """Litter never read low, no globe fault: a drawer jump on its own is most
+    likely sensor noise, so the reading dropping back clears it (as before)."""
+    det = Detector("COPTiP", DetectionConfig())
+    drawer_only(det)
+    assert feed(det, 15 * MIN, DFILevelPercent=75) == []        # litter OPTIMAL: nothing to restore
+    assert feed(det, 16 * MIN, DFILevelPercent=50) == []        # not back yet (> 16 + 25/2)
+    # a mid-cycle reading is not trusted
+    assert feed(det, 17 * MIN, "CLEAN_CYCLE", DFILevelPercent=0, robotCycleStatus="CYCLE_DUMP") == []
+    assert "litter_dump" in det.incidents
+    (done,) = feed(det, 20 * MIN, DFILevelPercent=18)
+    assert (done.key, done.kind, done.urgent) == ("litter_dump", "resolved", False)
+    assert "waste drawer back to 18%" in done.text and "never read low" in done.text
+    assert det.incidents == {}
+
+
+def test_drawer_jump_incident_with_litter_seen_low_only_resolves_on_litter_restored():
+    # litter turns out low AFTER the incident was opened by the drawer jump alone
+    det = Detector("COPTiP", DetectionConfig())
+    drawer_only(det)
+    low = dict(litterLevelPercentage=0.75, litterLevelState="LOW")      # no 25-point drop
+    assert feed(det, 15 * MIN, DFILevelPercent=75, **low) == []
+    assert det.incidents["litter_dump"]["litter_was_low"] is True
+    assert feed(det, 20 * MIN, DFILevelPercent=12, **low) == []         # drawer emptied: stays open
+    assert feed(det, 25 * MIN, DFILevelPercent=12, **low) == []
+    assert "litter_dump" in det.incidents
+    (done,) = feed(det, 30 * MIN, DFILevelPercent=12)                   # 90% OPTIMAL again
+    assert done.kind == "resolved" and "litter level back to 90%" in done.text
+
+    # litter is first seen low on the very reading where the drawer drops back
+    det = Detector("COPTiP", DetectionConfig())
+    drawer_only(det)
+    assert feed(det, 20 * MIN, DFILevelPercent=12, **low) == []
+    assert "litter_dump" in det.incidents
+
+    # litter already low when the drawer jumped
+    det = Detector("COPTiP", DetectionConfig())
+    feed(det, 0, DFILevelPercent=16, **low)
+    feed(det, 5 * MIN, DFILevelPercent=75, **low)
+    assert ("litter_dump", "new") in keys(feed(det, 10 * MIN, DFILevelPercent=75, **low))
+    assert all(a.key != "litter_dump" for a in feed(det, 20 * MIN, DFILevelPercent=12, **low))
+    assert "litter_dump" in det.incidents
+
+
+def test_drawer_jump_incident_with_a_globe_fault_or_other_evidence_is_not_noise():
+    fault = dict(globeMotorFaultStatus="FAULT_OVER_TORQUE")
+    # fault seen while the incident is open
+    det = Detector("COPTiP", DetectionConfig())
+    drawer_only(det)
+    feed(det, 12 * MIN, DFILevelPercent=75, **fault)
+    assert all(a.key != "litter_dump" for a in feed(det, 20 * MIN, DFILevelPercent=12))
+    assert det.incidents["litter_dump"]["fault_seen"] is True
+
+    # fault just before the jump (the "failed cycle" case: alert without confirmation)
+    det = Detector("COPTiP", DetectionConfig())
+    feed(det, 0, DFILevelPercent=16, **fault)
+    assert ("litter_dump", "new") in keys(feed(det, 5 * MIN, DFILevelPercent=75))
+    assert all(a.key != "litter_dump" for a in feed(det, 20 * MIN, DFILevelPercent=12))
+    assert "litter_dump" in det.incidents
+
+    # empty-cycle counter went up as well
+    det = Detector("COPTiP", DetectionConfig())
+    drawer_only(det)
+    assert keys(feed(det, 12 * MIN, DFILevelPercent=75, odometerEmptyCycles=4)) == [("litter_dump", "update")]
+    assert feed(det, 20 * MIN, DFILevelPercent=12, odometerEmptyCycles=4) == []
+    assert "litter_dump" in det.incidents
+
+    # incident persisted by an older version (no ``fault_seen``): stay conservative
+    det = Detector("COPTiP", DetectionConfig())
+    drawer_only(det)
+    del det.incidents["litter_dump"]["fault_seen"]
     assert feed(det, 20 * MIN, DFILevelPercent=12) == []
     assert "litter_dump" in det.incidents
 

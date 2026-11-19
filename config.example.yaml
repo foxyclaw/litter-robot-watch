@@ -67,7 +67,14 @@ checks:
         dump_max_alert_seconds: 86400   # stop reminding after a day
         dump_resolve_litter_percent: 80 # incident clears when litter is back: state not low, or % >= this
                                         # (emptying the waste drawer does NOT clear it)
-        # ── Litter level state ──
+        # ── Litter level ──
+        # Sensor note (LR4, calibrated 2026-11-19 after a deep clean): the litter
+        # level does NOT read 0 % when the globe is empty. A completely EMPTY globe
+        # reads 32 % (TOF litterLevel ~484 mm, state REFILL — not EMPTY); a normal
+        # full globe reads 90 % (~426-430 mm, optimalLitterLevel 450). Earlier dump
+        # events read 16-22 % (state EMPTY), so the floor is not fixed.
+        # At or below litter_empty_percent the alerts say "globe looks EMPTY".
+        litter_empty_percent: 45        # 0 = never add that wording
         litter_low_states: ["LOW", "REFILL", "EMPTY"]
         litter_low_repeat_seconds: 86400
         # ── Faults (globe motor, retract, pinch, USB, error statuses, offline) ──

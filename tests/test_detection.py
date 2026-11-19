@@ -212,11 +212,12 @@ def test_dump_alert_repeats_until_resolved():
     later = run(det, [(10 * MIN + i * 5 * MIN, "READY", dict(DFILevelPercent=73)) for i in range(1, 37)])
     assert keys(later) == [("litter_dump", "repeat")] * 3          # 3 hours -> 3 reminders
     assert "Reminder" in later[0][1].text
-    # the drawer is emptied: that alone never resolves a dump incident
-    emptied = run(det, [(3 * 3600 + 15 * MIN, "READY", dict(DFILevelPercent=16))])
-    assert emptied == [] and "litter_dump" in det.incidents
-    still = run(det, [(4 * 3600 + 10 * MIN, "READY", dict(DFILevelPercent=16))])
-    assert keys(still) == [("litter_dump", "repeat")]
+    # drawer-jump-only incident (litter never read low, no fault): the drawer
+    # reading dropping back clears it — sensor noise
+    back = run(det, [(3 * 3600 + 15 * MIN, "READY", dict(DFILevelPercent=16))])
+    assert keys(back) == [("litter_dump", "resolved")]
+    assert "waste drawer back to 16%" in back[0][1].text
+    assert det.incidents == {}
 
 
 def test_dump_resolved_by_litter_refill():

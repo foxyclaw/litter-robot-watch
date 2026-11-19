@@ -18,8 +18,12 @@ Signals
       or the litter-level state becomes EMPTY.
   Steps must persist for ``confirm_seconds``, except when a globe fault is
   latched / was just seen, or a dump incident is already open.
+  At or below ``litter_empty_percent`` (45) the wording says the globe looks
+  EMPTY — an empty LR4 globe reads ~32 %, not 0 (see the sensor notes below).
   The incident resolves only when the litter is back (seen low, then a settled
-  reading with a non-low level state or >= ``dump_resolve_litter_percent``);
+  reading with a non-low level state or >= ``dump_resolve_litter_percent``) —
+  except one opened by a drawer jump alone (litter never low, no globe fault),
+  which also clears when the drawer reading drops back (sensor noise);
   emptying the waste drawer does not resolve it. Reminders stop after
   ``dump_max_alert_seconds``.
 * ``litter_low``   — litter-level state is LOW / REFILL / EMPTY (suppressed
@@ -225,6 +229,18 @@ def is_active(reading: Dict[str, Any]) -> bool:
     return fast_poll_reason(reading) is not None
 
 
+# ── Litter level sensor notes (LR4, calibrated by the owner 2026-11-19) ─────────
+# ``litterLevelPercentage`` does NOT go down to 0 when the globe is empty:
+#   * completely EMPTY globe (after a deep clean): 32 %  (litterLevel ~484 mm,
+#     litterLevelState REFILL — not EMPTY!)
+#   * normal full globe: 90 %  (litterLevel ~426-430 mm, optimalLitterLevel 450)
+#   * earlier dump events read 16-22 % (state EMPTY), so the floor is not fixed.
+# So anything at or below ``litter_empty_percent`` (default 45) is worded as
+# "globe looks EMPTY", and a reading of ~30-40 % must never be read as "a third
+# of the litter is left".
+EMPTY_GLOBE_REFERENCE_PERCENT = 32.0    # what a completely empty globe read
+
+
 def _num(value: float) -> str:
     return f"{value:.0f}" if float(value).is_integer() else f"{value:.1f}"
 
@@ -240,6 +256,8 @@ class DetectionConfig:
     dump_repeat_seconds: float = 3600.0
     dump_max_alert_seconds: float = 86400.0
     dump_resolve_litter_percent: float = 80.0   # litter % that counts as "refilled"
+    # See "Litter level sensor notes" above: an empty globe reads ~32 %, not 0.
+    litter_empty_percent: float = 45.0   # litter % <= this is worded "globe looks EMPTY" (0 = off)
     litter_low_states: Tuple[str, ...] = ("LOW", "REFILL", "EMPTY")
     litter_low_repeat_seconds: float = 86400.0
     fault_repeat_seconds: float = 3600.0
@@ -263,6 +281,7 @@ class DetectionConfig:
             dump_resolve_litter_percent=float(
                 a.get("dump_resolve_litter_percent", d.dump_resolve_litter_percent)
             ),
+            litter_empty_percent=float(a.get("litter_empty_percent", d.litter_empty_percent)),
             litter_low_states=tuple(
                 str(s).upper() for s in a.get("litter_low_states", d.litter_low_states)
             ),
@@ -440,6 +459,16 @@ class Detector:
         hist.append([ts, value])
         return result
 
+    def _looks_empty(self, pct: Optional[float]) -> bool:
+        """An empty LR4 globe reads ~32 % (not 0), see the sensor notes above."""
+        limit = self.cfg.litter_empty_percent
+        return pct is not None and limit > 0 and pct <= limit
+
+    def _empty_note(self, pct: Optional[float]) -> str:
+        if not self._looks_empty(pct):
+            return ""
+        return f"globe looks EMPTY (empty globe reads ~{_num(EMPTY_GLOBE_REFERENCE_PERCENT)}%)"
+
     def _dump_text(self, inc: Dict[str, Any]) -> str:
         """Stage-aware wording. "Into the drawer" is only ever said once the
         drawer level has actually jumped."""
@@ -457,6 +486,10 @@ class Detector:
             )
         if drop:
             pair = f"{_num(drop[0])}%→{_num(drop[1])}%"
+            now_pct = inc.get("litter_now")     # latest at-rest reading (reminders stay current)
+            if now_pct is None:
+                now_pct = drop[1]
+            note = self._empty_note(now_pct)
             extra = [r for r in reasons if not r.startswith("litter level ")]
             if inc.get("waste_at_open") is not None:
                 extra.append(f"waste drawer unchanged at {_num(inc['waste_at_open'])}%")
@@ -464,7 +497,8 @@ class Detector:
                 f"🚨 <b>{n}</b>: litter level dropped {pair}"
                 + (" after a failed cycle" if inc.get("after_fault") else "")
                 + " — litter missing from the globe or globe not level. "
-                "Do NOT let it cycle again until checked (the next cycle tends to dump "
+                + (f"Litter level {_num(now_pct)}% — {note}. " if note else "")
+                + "Do NOT let it cycle again until checked (the next cycle tends to dump "
                 "the litter into the drawer)."
                 + (f" [{html.escape('; '.join(extra))}]" if extra else "")
             )
@@ -488,6 +522,28 @@ class Detector:
             return True
         return False
 
+    @staticmethod
+    def _note_reading(inc: Dict[str, Any], r: Dict[str, Any], after_fault: bool) -> None:
+        """Per-reading bookkeeping on an open dump incident."""
+        if after_fault or has_fault(r):
+            inc["fault_seen"] = True
+        if is_settled(r) and r.get("litter_pct") is not None:
+            inc["litter_now"] = r["litter_pct"]
+
+    @staticmethod
+    def _drawer_jump_only(inc: Dict[str, Any]) -> bool:
+        """The incident rests on a waste-drawer jump and nothing else: the litter
+        never read low or dropped, no globe fault, no empty-cycle evidence.
+        (``fault_seen`` missing = opened by an older version: stay conservative.)"""
+        reasons = inc.get("reasons") or []
+        return bool(
+            inc.get("drawer_jump") is True
+            and inc.get("fault_seen") is False
+            and not inc.get("litter_was_low")
+            and not inc.get("litter_drop")
+            and reasons and all(x.startswith("waste drawer ") for x in reasons)
+        )
+
     def _dump(self, prev: Optional[Dict[str, Any]], r: Dict[str, Any], now: float) -> List[Alert]:
         cfg = self.cfg
         reasons: List[str] = []
@@ -505,6 +561,8 @@ class Detector:
             0 <= now - fault_ts <= cfg.window_seconds + cfg.confirm_seconds
         confirm = 0.0 if (after_fault or inc) else None
         restored = self._litter_restored(r)
+        if inc:
+            self._note_reading(inc, r, after_fault)
 
         if prev:
             ec_prev, ec = prev.get("empty_cycles"), r.get("empty_cycles")
@@ -541,7 +599,9 @@ class Detector:
                     "since": now, "reasons": [], "waste_before": None, "litter_was_low": False,
                     "drawer_jump": False, "litter_drop": None, "after_fault": False,
                     "waste_at_open": waste if is_settled(r) else None,
+                    "fault_seen": False, "litter_now": None,
                 }
+                self._note_reading(inc, r, after_fault)
             inc["reasons"] += [x for x in reasons if x not in inc["reasons"]]
             if drawer_jump:
                 inc["drawer_jump"] = True
@@ -565,6 +625,9 @@ class Detector:
         # incident and a settled reading now shows it restored. The waste drawer
         # going back down proves nothing — on 2026-11-19 the owner emptied the
         # drawer during a deep clean while the globe still had no litter.
+        # The one exception is an incident opened by a drawer jump ALONE (litter
+        # never read low, no litter drop, no globe fault): that is most likely
+        # drawer-sensor noise, and it clears when the drawer reading drops back.
         if restored is False:
             inc["litter_was_low"] = True
         elif restored and inc.get("litter_was_low"):
@@ -574,8 +637,15 @@ class Detector:
                           f"✅ <b>{self._n}</b>: litter-dump alert cleared "
                           f"(litter level back to {level}).", urgent=False)]
         wb = inc.get("waste_before")
-        if (is_settled(r) and wb is not None and waste is not None and not inc.get("drawer_emptied")
-                and waste <= wb + cfg.waste_jump_points / 2):
+        drawer_back = (is_settled(r) and wb is not None and waste is not None
+                       and waste <= wb + cfg.waste_jump_points / 2)
+        if drawer_back and self._drawer_jump_only(inc):
+            del self.incidents["litter_dump"]
+            return [Alert("litter_dump", "resolved",
+                          f"✅ <b>{self._n}</b>: litter-dump alert cleared "
+                          f"(waste drawer back to {_num(waste)}%, litter level never read low"
+                          f" — probably drawer-sensor noise).", urgent=False)]
+        if drawer_back and not inc.get("drawer_emptied"):
             inc["drawer_emptied"] = True    # logged once, never announced
             logger.info(
                 f"{self.name}: waste drawer emptied ({_num(waste)}%) while the litter-dump "
@@ -654,6 +724,9 @@ class Detector:
         if state in cfg.litter_low_states:
             pct = r.get("litter_pct")
             pct_s = f" ({_num(pct)}%)" if pct is not None else ""
+            note = self._empty_note(pct)
+            if note:
+                pct_s += f" — {note}"
             conds["litter_low"] = {
                 "grace": cfg.confirm_seconds, "repeat": cfg.litter_low_repeat_seconds,
                 "urgent": state == "EMPTY", "rank": LITTER_STATE_RANK.get(state, 1),
