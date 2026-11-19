@@ -237,6 +237,11 @@ class Alert:
     urgent: bool = True
 
     @property
+    def critical(self) -> bool:
+        """True for incidents that also go out as DMs and get an incident file."""
+        return is_critical(self.key)
+
+    @property
     def plain(self) -> str:
         """Text without HTML tags, for logs / DB."""
         import re
@@ -248,6 +253,21 @@ _HARD_ERROR_STATUSES = {
     name for name, (_d, typ) in STATUS_CODES.items()
     if typ == "error" and name not in STATUS_ALIASES
 } - DRAWER_STATUSES - {"OFFLINE", "BONNET_REMOVED"} - PINCH_STATUSES
+
+# Incidents that need a human right now: besides the group alert they are sent
+# as a DM to ``telegram.alert_dm_user_ids`` and get a forensic incident file.
+# (Routine things — waste drawer %, low litter, USB, bonnet/paused — are not.)
+CRITICAL_KEYS = {
+    "litter_dump", "globe_motor_fault", "globe_retract_fault", "pinch",
+    "offline", "api_unreachable",   # robot offline / monitor blind
+}
+
+
+def is_critical(key: str) -> bool:
+    """Litter dumped, globe motor / retract fault, pinch, hardware error status, offline."""
+    if key in CRITICAL_KEYS:
+        return True
+    return key.startswith("status:") and key.split(":", 1)[1] in _HARD_ERROR_STATUSES
 
 
 class Detector:

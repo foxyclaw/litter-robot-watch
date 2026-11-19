@@ -57,6 +57,8 @@ def build_global_notifier(config: dict) -> TelegramNotifier | None:
         notifier = TelegramNotifier(tg["bot_token"], str(tg["chat_id"]), outbox_path=str(outbox))
         # Optional: Telegram user IDs whose direct messages the bot also answers.
         notifier.authorized_user_ids = [str(u) for u in tg.get("authorized_user_ids") or []]
+        # Optional: critical incidents are also sent to these users as a DM.
+        notifier.alert_dm_user_ids = [str(u) for u in tg.get("alert_dm_user_ids") or []]
         notifier.ensure_retry_task()  # deliver anything left over from a previous run
         return notifier
     return None

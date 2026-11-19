@@ -9,6 +9,10 @@ Each poll (and each websocket push, when enabled):
      that repeat until resolved;
   4. the waste-drawer alert fires on the percentage alone (>= waste_threshold),
      repeating every ``waste_repeat_seconds``.
+
+Critical incidents (litter dump, globe motor / retract fault, pinch, hardware
+error status, offline / cloud unreachable) are additionally sent as a DM to
+``telegram.alert_dm_user_ids`` and documented in ``data/incidents/*.json``.
 """
 import asyncio
 import copy
@@ -35,11 +39,15 @@ from detection import (
     is_active,
 )
 from forensics import SnapshotLog
+from incidents import IncidentStore, utc_iso
 from notifier import TelegramNotifier
 from status_codes import STATUS_CODES, canonical_set, canonical_status, describe_status  # noqa: F401
 from timeutil import DEFAULT_TZ, fmt_local, parse_utc
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+INCIDENT_SNAPSHOT_WINDOW_SECONDS = 1800   # raw snapshots kept in an incident file
+INCIDENT_ACTIVITY_ENTRIES = 50            # stored activity entries kept in an incident file
 
 ACTIVITY_QUERY = """
 query GetLR4Activity($serial: String!, $limit: Int, $consumer: String) {
@@ -77,6 +85,8 @@ class LitterRobotCheck(BaseCheck):
         self.retention_days = int(forensics.get("retention_days", 90))
         self.activity_interval = float(forensics.get("activity_interval_seconds", 300))
         self.snapshot_log = SnapshotLog(str(self.data_dir), self.retention_days)
+        self.incident_store = IncidentStore(str(self.data_dir / "incidents"))
+        self._bg_tasks: set = set()
 
         realtime = config.get("realtime", {}) or {}
         self.ws_enabled = bool(realtime.get("websocket", True))
@@ -105,6 +115,7 @@ class LitterRobotCheck(BaseCheck):
                 outbox_path=None if dry_run else str(self.data_dir / "telegram_outbox_litter.json"),
             )
             self.telegram.authorized_user_ids = [str(u) for u in tg.get("authorized_user_ids") or []]
+            self.telegram.alert_dm_user_ids = [str(u) for u in tg.get("alert_dm_user_ids") or []]
             self.logger.info("Litter Robot: using dedicated Telegram notifier")
         else:
             self.telegram = notifier  # fall back to shared notifier
@@ -314,7 +325,7 @@ class LitterRobotCheck(BaseCheck):
         before = json.dumps(det.state, sort_keys=True, default=str)
         now = time.time()
         alerts = det.process_reachable(now) if reachable else det.process_unreachable(now)
-        await self._dispatch("_api", alerts)
+        await self._dispatch("_api", alerts, now=now)
         if not self.dry_run and json.dumps(det.state, sort_keys=True, default=str) != before:
             await self.db.set_kv("detector:_api", det.state)
 
@@ -463,7 +474,7 @@ class LitterRobotCheck(BaseCheck):
             if self.dry_run:
                 det = Detector(name, self.det_cfg, copy.deepcopy(det.state))
             alerts = det.process(fields, now)
-            await self._dispatch(robot_id, alerts)
+            await self._dispatch(robot_id, alerts, raw=raw, now=now)
             if not self.dry_run:
                 await self.db.set_kv(f"detector:{robot_id}", det.state)
 
@@ -476,7 +487,9 @@ class LitterRobotCheck(BaseCheck):
                 self._fast_until = time.time() + self.fast_hold
             return alerts
 
-    async def _dispatch(self, robot_id: str, alerts: List[Alert]) -> None:
+    async def _dispatch(self, robot_id: str, alerts: List[Alert],
+                        raw: Optional[Dict[str, Any]] = None, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
         for alert in alerts:
             prefix = "DRY-RUN (not sent) " if self.dry_run else ""
             self.logger.warning(f"{prefix}ALERT [{alert.key}/{alert.kind}] {alert.plain}")
@@ -488,9 +501,118 @@ class LitterRobotCheck(BaseCheck):
                 self.logger.error(f"Storing alert failed: {e}")
             if self.telegram:
                 try:
-                    await self.telegram.send_reliable(alert.text)
+                    # critical: group + DM to telegram.alert_dm_user_ids (first alert,
+                    # every reminder and the resolved message)
+                    if alert.critical and hasattr(self.telegram, "send_critical"):
+                        await self.telegram.send_critical(alert.text)
+                    else:
+                        await self.telegram.send_reliable(alert.text)
                 except Exception as e:
                     self.logger.error(f"Telegram alert failed: {type(e).__name__}: {e}")
+            if alert.critical:
+                try:
+                    await self._record_incident(robot_id, alert, raw, now)
+                except Exception as e:  # forensics must never break alerting
+                    self.logger.error(f"Incident snapshot failed: {type(e).__name__}: {e}")
+
+    # ── incident files (data/incidents/<YYYYmmdd-HHMMSS>-<kind>.json) ────────
+
+    async def _incident_context(self, robot_id: str, now: float) -> Dict[str, Any]:
+        since = datetime.fromtimestamp(now - INCIDENT_SNAPSHOT_WINDOW_SECONDS, tz=timezone.utc)
+        rid = None if robot_id == "_api" else robot_id   # cloud unreachable: all robots
+        return {
+            "raw_snapshots": await self.db.get_raw_snapshots_since(
+                rid, since.strftime("%Y-%m-%d %H:%M:%S")),
+            "activity_history": await self.db.get_activities(
+                rid, limit=INCIDENT_ACTIVITY_ENTRIES, with_raw=True),
+        }
+
+    async def _record_incident(self, robot_id: str, alert: Alert,
+                               raw: Optional[Dict[str, Any]], now: float) -> None:
+        """Open / update / close the forensic file of a critical incident."""
+        kv_key = f"incident_file:{robot_id}:{alert.key}"
+        event = {"ts": utc_iso(now), "kind": alert.kind, "text": alert.plain}
+        det = self._api_detector if robot_id == "_api" else self.detectors.get(robot_id)
+        stored = await self.db.get_kv(kv_key)
+        path = Path(stored) if stored else None
+
+        if alert.kind == "new":
+            doc = {
+                "incident": alert.key,
+                "robot_id": robot_id,
+                "robot_name": det.name if det else robot_id,
+                "opened_at": utc_iso(now),
+                "opened_at_local": fmt_local(now, "%Y-%m-%d %H:%M:%S %Z", self.tz_name),
+                "trigger": {
+                    "reason": alert.plain,
+                    "details": copy.deepcopy(det.incidents.get(alert.key)) if det else None,
+                },
+                "current_raw": raw,
+                **await self._incident_context(robot_id, now),
+                "activity_fresh": None,
+                "alerts": [event],
+                "resolved": None,
+            }
+            path = self.incident_store.create(alert.key, now, doc)
+            await self.db.set_kv(kv_key, str(path))
+            self.logger.warning(f"INCIDENT {alert.key} opened — snapshot written to {path}")
+            if robot_id == "_api":   # the cloud is unreachable: nothing to fetch
+                self.incident_store.update(path, activity_fresh={"error": "Whisker cloud unreachable"})
+                return
+            # immediately pull the freshest activity feed (read-only) into the file
+            task = asyncio.get_running_loop().create_task(self._add_fresh_activity(robot_id, path))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            return
+
+        if alert.kind == "resolved":
+            final = {
+                "ts": utc_iso(now),
+                "reason": alert.plain,
+                "current_raw": raw,
+                **await self._incident_context(robot_id, now),
+            }
+            if path and self.incident_store.update(path, append={"alerts": event}, resolved=final):
+                self.logger.info(f"INCIDENT {alert.key} resolved — final snapshot added to {path}")
+            else:  # opened before incident files existed, or the file was removed
+                path = self.incident_store.create(
+                    alert.key, now, {"incident": alert.key, "robot_id": robot_id, "resolved": final},
+                    suffix="-resolved",
+                )
+                self.logger.info(f"INCIDENT {alert.key} resolved — final snapshot written to {path}")
+            await self.db.set_kv(kv_key, None)
+            return
+
+        if path:  # reminder / new evidence
+            self.incident_store.update(path, append={"alerts": event})
+
+    async def _add_fresh_activity(self, robot_id: str, path: Path) -> None:
+        """Fetch the activity feed right now (read-only query) and add it to the incident file."""
+        fresh: Dict[str, Any] = {"fetched_at": utc_iso(time.time())}
+        try:
+            robot = self.robots.get(robot_id)
+            if robot is None:
+                raise RuntimeError("robot not connected")
+            entries = await self._fetch_activity(robot, limit=100)
+            fresh["entries"] = entries
+            try:
+                fresh["new_entries"] = len(await self.db.store_activities(robot_id, entries))
+            except Exception as e:
+                self.logger.debug(f"Storing fresh activity failed: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            fresh["error"] = f"{type(e).__name__}: {e}"
+            self.logger.warning(f"Incident fresh activity fetch failed: {fresh['error']}")
+        try:
+            self.incident_store.update(path, activity_fresh=fresh)
+        except Exception as e:
+            self.logger.error(f"Updating incident file failed: {type(e).__name__}: {e}")
+
+    async def wait_background(self) -> None:
+        """Wait for pending incident follow-up work (used by tests / shutdown)."""
+        while self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
 
     async def _check_waste_alert(self, robot_id: str, state: Dict[str, Any], now: float) -> None:
         """Waste alert: trust the percentage only (ignore is_waste_drawer_full /

@@ -5,6 +5,10 @@
 retried in the background with exponential backoff, so an alert is not lost
 during a network blip. The queue is optionally persisted to a JSON file so it
 also survives a restart.
+``send_critical`` — ``send_reliable`` to the group AND to every user in
+``alert_dm_user_ids`` as a direct message (same retry queue). A user who never
+started the bot answers 403: that is logged as a WARNING once per user per day
+and never queued.
 """
 import asyncio
 import json
@@ -36,6 +40,9 @@ class TelegramNotifier:
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         self.logger = logging.getLogger(__name__)
         self.authorized_user_ids: List[str] = []  # used by the command bot
+        self.alert_dm_user_ids: List[str] = []    # critical alerts are also DMed to these
+        self.last_status: Optional[int] = None    # HTTP status of the last attempt (None = network error)
+        self._forbidden_logged: Dict[str, str] = {}  # user id -> day the 403 warning was logged
         self._outbox_path = Path(outbox_path) if outbox_path else None
         self._queue: List[Dict[str, Any]] = self._load_outbox()
         self._retry_task: Optional[asyncio.Task] = None
@@ -50,9 +57,11 @@ class TelegramNotifier:
             "parse_mode": "HTML",
             "disable_notification": False,
         }
+        self.last_status = None
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
                 async with session.post(f"{self.base_url}/sendMessage", json=payload) as response:
+                    self.last_status = response.status
                     if response.status == 200:
                         return True, False, 0.0
                     text = await response.text()
@@ -63,7 +72,8 @@ class TelegramNotifier:
                         except Exception:
                             retry_after = 5.0
                     retryable = response.status == 429 or response.status >= 500
-                    self.logger.error(f"Telegram API error: {response.status} - {text[:300]}")
+                    if not self._is_forbidden_dm(payload["chat_id"]):  # that one is logged by the caller
+                        self.logger.error(f"Telegram API error: {response.status} - {text[:300]}")
                     return False, retryable, retry_after
         except asyncio.CancelledError:
             raise
@@ -75,6 +85,23 @@ class TelegramNotifier:
     def _scrub(self, text: str) -> str:
         return text.replace(self.bot_token, "<token>")
 
+    def _is_forbidden_dm(self, chat_id: Optional[str]) -> bool:
+        """Last attempt was a DM answered with 403 (user never started / blocked the bot)."""
+        return self.last_status == 403 and chat_id is not None and str(chat_id) != self.chat_id
+
+    def _log_rejected(self, chat_id: Optional[str], what: str) -> None:
+        """Log a non-retryable rejection; a 403 on a DM only once per user per day."""
+        if not self._is_forbidden_dm(chat_id):
+            self.logger.error(f"{what} rejected (not retryable) — dropped")
+            return
+        user, today = str(chat_id), time.strftime("%Y-%m-%d")
+        if self._forbidden_logged.get(user) != today:
+            self._forbidden_logged[user] = today
+            self.logger.warning(
+                f"Telegram DM to user {user} failed with 403 — they must open the bot and "
+                f"press Start before it can message them. Not retried (logged once per day)."
+            )
+
     async def send_message(self, message: str, chat_id: Optional[str] = None,
                            attempts: int = 3) -> bool:
         """Send now, with a few quick retries. Returns True if delivered."""
@@ -83,7 +110,10 @@ class TelegramNotifier:
             if ok:
                 self.logger.info(f"Telegram message sent to {chat_id or self.chat_id}")
                 return True
-            if not retryable or attempt == attempts:
+            if not retryable:
+                self._log_rejected(chat_id, "Telegram message")
+                return False
+            if attempt == attempts:
                 return False
             await asyncio.sleep(max(retry_after, float(attempt)))
         return False
@@ -101,10 +131,28 @@ class TelegramNotifier:
             self.logger.info(f"Telegram message sent to {chat_id or self.chat_id}")
             return True
         if not retryable:
-            self.logger.error("Telegram rejected the message (not retryable) — dropped")
+            self._log_rejected(chat_id, "Telegram message")
             return False
         self._enqueue(message, chat_id)
         return False
+
+    async def send_critical(self, message: str) -> bool:
+        """Critical alert: group chat plus a DM to every ``alert_dm_user_ids`` user.
+
+        Every copy goes through ``send_reliable`` (queued + retried on network
+        errors). Returns the result of the group send.
+        """
+        ok = await self.send_reliable(message)
+        for user_id in dict.fromkeys(str(u) for u in self.alert_dm_user_ids):
+            if user_id == self.chat_id:
+                continue
+            try:
+                await self.send_reliable(message, chat_id=user_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # a broken DM must never block the others
+                self.logger.error(f"Telegram DM to {user_id} failed: {type(e).__name__}")
+        return ok
 
     @property
     def pending(self) -> int:
@@ -148,7 +196,7 @@ class TelegramNotifier:
                 self.logger.info(f"Queued Telegram message delivered after {int(age)}s")
                 continue
             if not retryable:
-                self.logger.error("Queued Telegram message rejected (not retryable) — dropped")
+                self._log_rejected(item.get("chat_id"), "Queued Telegram message")
                 continue
             item["attempts"] = item.get("attempts", 1) + 1
             remaining.append(item)

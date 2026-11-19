@@ -448,6 +448,27 @@ class LitterRobotDatabase:
                 return None
             return {"ts": row[0], "source": row[1], "status": row[2], "data": json.loads(row[3])}
 
+    async def get_raw_snapshots_since(self, robot_id: Optional[str], since_ts: str,
+                                      limit: int = 2000) -> List[Dict[str, Any]]:
+        """Raw snapshots with ts >= since_ts (UTC 'YYYY-MM-DD HH:MM:SS'), oldest
+        first. ``robot_id=None`` returns all robots."""
+        async with self._connection.execute(
+            """SELECT ts, source, status, json, robot_id FROM
+                   (SELECT id, ts, source, status, json, robot_id FROM raw_snapshots
+                    WHERE (? IS NULL OR robot_id = ?) AND ts >= ? ORDER BY id DESC LIMIT ?)
+               ORDER BY id""",
+            (robot_id, robot_id, since_ts, int(limit)),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        out = []
+        for r in rows:
+            try:
+                data = json.loads(r[3])
+            except ValueError:
+                data = r[3]
+            out.append({"ts": r[0], "robot_id": r[4], "source": r[1], "status": r[2], "data": data})
+        return out
+
     async def prune_raw_snapshots(self, keep_days: int) -> int:
         """Delete raw snapshots older than keep_days. Returns rows deleted."""
         cursor = await self._connection.execute(
@@ -478,9 +499,10 @@ class LitterRobotDatabase:
         await self._connection.commit()
         return new
 
-    async def get_activities(self, robot_id: Optional[str] = None, limit: int = 30) -> List[Dict[str, Any]]:
+    async def get_activities(self, robot_id: Optional[str] = None, limit: int = 30,
+                             with_raw: bool = False) -> List[Dict[str, Any]]:
         """Most recent stored activity entries, newest first."""
-        query = "SELECT robot_id, timestamp, action, action_value FROM activity_history"
+        query = "SELECT robot_id, timestamp, action, action_value, raw_json FROM activity_history"
         params: list = []
         if robot_id:
             query += " WHERE robot_id = ?"
@@ -489,10 +511,16 @@ class LitterRobotDatabase:
         params.append(limit)
         async with self._connection.execute(query, params) as cursor:
             rows = await cursor.fetchall()
-            return [
-                {"robot_id": r[0], "timestamp": r[1], "action": r[2], "action_value": r[3]}
-                for r in rows
-            ]
+        out = []
+        for r in rows:
+            entry = {"robot_id": r[0], "timestamp": r[1], "action": r[2], "action_value": r[3]}
+            if with_raw:
+                try:
+                    entry["raw"] = json.loads(r[4]) if r[4] else None
+                except ValueError:
+                    entry["raw"] = r[4]
+            out.append(entry)
+        return out
 
     async def count_activities(self, robot_id: str) -> int:
         async with self._connection.execute(
