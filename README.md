@@ -19,7 +19,8 @@ silenced with `/ack`.
 | Alert | Trigger | Repeat |
 |-------|---------|--------|
 | 🚨 **Litter missing / dumped** | Any of: litter level steps down by ≥ `dump_litter_drop_points` (25) — *stage 1: litter missing from the globe or globe not level* · waste-drawer level steps up by ≥ `dump_waste_jump_points` (25) within `dump_window_seconds` (15 min) — *stage 2: litter dumped into the drawer* · the empty-cycle odometer increments · an `EMPTY_CYCLE` status is seen · litter-level state becomes `EMPTY`. A step must persist for `dump_confirm_seconds` (5 min), except right after a globe fault or when the incident is already open | every `dump_repeat_seconds` (1 h) for up to `dump_max_alert_seconds` (24 h). Clears only when the litter is back: level state no longer low, or litter ≥ `dump_resolve_litter_percent` (80 %) on an at-rest reading. Emptying the waste drawer does **not** clear it (logged only) — except an incident opened by a drawer jump **alone** (litter never read low, no litter drop, no globe fault, no empty-cycle evidence): that one is treated as drawer-sensor noise and also clears when the drawer reading drops back |
-| ⚠️ Litter low | litter-level state in `litter_low_states` (LOW / REFILL / EMPTY). Suppressed while a litter-dump incident is open and not yet `/ack`ed (it would repeat the same news); takes over after `/ack` or the 24 h cap if the litter is still low. At or below `litter_empty_percent` (45 %) the text adds "globe looks EMPTY" (see [Litter level sensor notes](#litter-level-sensor-notes)) | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
+| 🚨 Litter VERY low | a settled (globe at rest) reading with `litterLevel` ≥ `litter_very_low_mm` (475 mm — the last ~20 % of the usable depth between 439 mm full line and 484 mm empty) for `dump_confirm_seconds` (5 min); if the mm value is missing, litter % ≤ `litter_very_low_percent` (50). Sent to the group **and as a DM** to `telegram.alert_dm_user_ids`. Stays on until the litter is restored (level state not low, or % ≥ `dump_resolve_litter_percent`), then ✅. Suppressed while a litter-dump incident is open (the dump alert covers it) and takes over when that closes with the litter still very low. At or below `litter_empty_percent` it says "globe looks EMPTY" | every `litter_very_low_repeat_seconds` (3 h) until restored or `/ack` |
+| ⚠️ Litter low | the gentle tier (group only): litter-level state in `litter_low_states` (LOW / REFILL / EMPTY). Suppressed while a litter-dump incident is open and not yet `/ack`ed (it would repeat the same news); takes over after `/ack` or the 24 h cap if the litter is still low. Also suppressed while "Litter VERY low" is active (one alert per problem). At or below `litter_empty_percent` (45 %) the text adds "globe looks EMPTY" (see [Litter level sensor notes](#litter-level-sensor-notes)) | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
 | 🚨 Globe motor fault / retract fault | status ≠ `FAULT_CLEAR` | every `fault_repeat_seconds` (1 h) |
 | 🚨 Pinch detected | pinch status / pinch fault reported | 1 h |
 | ⚠️ USB fault | `USBFaultStatus` ≠ `CLEAR` | 1 h |
@@ -55,8 +56,10 @@ The 🚨 incidents that need someone right now — **litter dumped, globe motor 
 retract fault, pinch, hardware error status, offline (robot or Whisker cloud)**
 — are sent to the group *and* as a direct message to every user ID listed in
 `telegram.alert_dm_user_ids`: the first alert, every reminder, and the ✅
-resolved message. Routine alerts (waste drawer %, low litter, USB, bonnet
-removed / paused) stay in the group only.
+resolved message. **Litter VERY low** is sent the same way (group + DM), but it
+is not a fault and gets no forensic incident file. Routine alerts (waste
+drawer %, the gentle litter-low tier, USB, bonnet removed / paused) stay in the
+group only.
 
 A bot can only DM someone who has opened it and pressed **Start**. Until then
 Telegram answers 403; that is logged as one WARNING per user per day and the DM
@@ -97,10 +100,34 @@ globe the reported percentage is still well above zero. Calibration by the owner
 | Globe | `litterLevelPercentage` | `litterLevel` (TOF, mm) | `litterLevelState` |
 |-------|------------------------|-------------------------|--------------------|
 | completely **EMPTY** (no litter at all) | **32 %** | ~484 | `REFILL` (not `EMPTY`!) |
-| normal, full | 90 % | ~426–430 (`optimalLitterLevel` 450) | `OPTIMAL` |
+| filled **exactly to the full line** (2026-11-19) | 90 % | **439** | `OPTIMAL` |
+| fuller than the line (earlier readings) | 90 % | ~426–430 (`optimalLitterLevel` 450) | `OPTIMAL` |
 | earlier dump events | 16–22 % | — | `EMPTY` |
 
+In our data the robot's percentage follows the TOF distance exactly:
+
+    litter % = 2 × (500 − litterLevel mm), capped at 90
+    (480 mm → 40 %, 482 mm → 36 %, 484 mm → 32 %)
+
+so it **saturates at 90 %** for any reading ≤ ~455 mm and only moves in the
+bottom part of the range — a globe can lose a good part of its litter while the
+app still shows 90 %. The robot's states by percentage, over 7 months of history:
+
+| `litterLevelState` | litter % |
+|--------------------|----------|
+| `OPTIMAL` | ≥ 76 |
+| `LOW` | 62–74 |
+| `REFILL` | 28–60 |
+| `EMPTY` | ≤ 22 |
+
 What follows from that:
+
+- The usable depth is the ~45 mm between 439 mm (full line) and 484 mm (empty).
+  The "Litter VERY low" alert fires at `alerts.litter_very_low_mm` (default
+  475 mm = 50 %, the last ~20 % of that depth) and uses the mm value, not the
+  percentage; `alerts.litter_very_low_percent` (50) is only the fallback when
+  the mm value is missing. Example:
+  `🚨 COPTiP: litter is VERY low (50%, 475 mm; full line ≈439 mm, empty ≈484 mm). Add litter.`
 
 - The floor is **not fixed**: an empty globe has read anything from 16 % to
   32 % (why it varies is not known). The
@@ -229,6 +256,9 @@ credentials) and edit it. Keys of the `litter_robot` check:
 | `config.alerts.litter_empty_percent` | 45 | litter % at or below which alerts say "globe looks EMPTY" (an empty globe reads ~32 %, not 0; 0 = off) |
 | `config.alerts.litter_low_states` | LOW, REFILL, EMPTY | litter states that alert |
 | `config.alerts.litter_low_repeat_seconds` | 86400 | litter-low reminder interval |
+| `config.alerts.litter_very_low_mm` | 475 | "Litter VERY low": settled `litterLevel` (mm) at or above this (0 = off) |
+| `config.alerts.litter_very_low_percent` | 50 | fallback when the mm value is missing: litter % at or below this (0 = off) |
+| `config.alerts.litter_very_low_repeat_seconds` | 10800 | "Litter VERY low" reminder interval (3 h), until restored or `/ack` |
 | `config.alerts.fault_repeat_seconds` | 3600 | fault / offline reminder interval |
 | `config.alerts.offline_minutes` | 30 | offline / cloud-unreachable grace |
 | `config.alerts.status_grace_seconds` | 600 | bonnet removed / paused / off grace |

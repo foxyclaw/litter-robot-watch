@@ -10,8 +10,9 @@ telegram:
   authorized_user_ids: []
   # Telegram user IDs that ALSO get critical alerts as a direct message, in
   # addition to the group: litter dumped, globe motor / retract fault, pinch,
-  # hardware error status, offline — first alert, every reminder and the ✅
-  # resolved message. Not used for routine alerts (waste drawer, low litter).
+  # hardware error status, offline, and litter VERY low — first alert, every
+  # reminder and the ✅ resolved message. Not used for routine alerts (waste
+  # drawer, gentle low-litter).
   # Each user must open the bot and press Start once, or Telegram answers 403.
   alert_dm_user_ids: []
 
@@ -70,13 +71,22 @@ checks:
         # ── Litter level ──
         # Sensor note (LR4, calibrated 2026-11-19 after a deep clean): the litter
         # level does NOT read 0 % when the globe is empty. A completely EMPTY globe
-        # reads 32 % (TOF litterLevel ~484 mm, state REFILL — not EMPTY); a normal
-        # full globe reads 90 % (~426-430 mm, optimalLitterLevel 450). Earlier dump
+        # reads 32 % (TOF litterLevel ~484 mm, state REFILL — not EMPTY); filled
+        # exactly to the full line it reads 90 % OPTIMAL at 439 mm. Earlier dump
         # events read 16-22 % (state EMPTY), so the floor is not fixed.
+        # The robot's % = 2 * (500 - mm), capped at 90: it saturates at 90 % for
+        # any mm <= ~455 and only moves in the bottom part of the range.
         # At or below litter_empty_percent the alerts say "globe looks EMPTY".
         litter_empty_percent: 45        # 0 = never add that wording
         litter_low_states: ["LOW", "REFILL", "EMPTY"]
         litter_low_repeat_seconds: 86400
+        # Two tiers: litter_low above is the gentle one (group only, daily).
+        # "Litter VERY low" (group + DM to telegram.alert_dm_user_ids, repeated
+        # until the litter is restored: state not low, or % >= dump_resolve_litter_percent):
+        litter_very_low_mm: 475         # settled litterLevel (mm) >= this = last ~20 % of the
+                                        # usable depth between 439 (full line) and 484 (empty); 0 = off
+        litter_very_low_percent: 50     # used ONLY when the mm value is missing: litter % <= this; 0 = off
+        litter_very_low_repeat_seconds: 10800  # remind every 3 h until restored or /ack
         # ── Faults (globe motor, retract, pinch, USB, error statuses, offline) ──
         fault_repeat_seconds: 3600      # remind every hour until resolved or /ack
         offline_minutes: 30             # robot offline / Whisker cloud unreachable for this long

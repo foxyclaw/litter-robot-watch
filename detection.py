@@ -26,6 +26,12 @@ Signals
   which also clears when the drawer reading drops back (sensor noise);
   emptying the waste drawer does not resolve it. Reminders stop after
   ``dump_max_alert_seconds``.
+* ``litter_very_low`` — a settled reading with ``litterLevel`` (TOF, mm) >=
+  ``litter_very_low_mm`` (475), or — only when the mm value is missing —
+  litter % <= ``litter_very_low_percent`` (50). Group + DM, repeated every
+  ``litter_very_low_repeat_seconds`` (3 h) until the litter is restored (level
+  state not low, or % >= ``dump_resolve_litter_percent``). Suppressed while a
+  ``litter_dump`` incident is open; replaces ``litter_low`` while it is active.
 * ``litter_low``   — litter-level state is LOW / REFILL / EMPTY (suppressed
   while a ``litter_dump`` incident is open and not acknowledged: it would say
   the same thing twice; it takes over after /ack or the 24 h cap).
@@ -233,12 +239,21 @@ def is_active(reading: Dict[str, Any]) -> bool:
 # ``litterLevelPercentage`` does NOT go down to 0 when the globe is empty:
 #   * completely EMPTY globe (after a deep clean): 32 %  (litterLevel ~484 mm,
 #     litterLevelState REFILL — not EMPTY!)
-#   * normal full globe: 90 %  (litterLevel ~426-430 mm, optimalLitterLevel 450)
+#   * filled exactly to the full line: 90 %, OPTIMAL, litterLevel 439 mm
+#     (fuller globes have read ~426-430 mm; optimalLitterLevel 450)
+#   * the robot's percentage follows  pct = 2 * (500 - mm), capped at 90
+#     (480 mm -> 40, 482 -> 36, 484 -> 32): it SATURATES at 90 % for any
+#     mm <= ~455 and only moves in the bottom part of the range, so the mm
+#     value is the better "how much is left" signal.
+#   * robot states by % (7 months of history): OPTIMAL >= 76, LOW 62-74,
+#     REFILL 28-60, EMPTY <= 22.
 #   * earlier dump events read 16-22 % (state EMPTY), so the floor is not fixed.
 # So anything at or below ``litter_empty_percent`` (default 45) is worded as
 # "globe looks EMPTY", and a reading of ~30-40 % must never be read as "a third
 # of the litter is left".
 EMPTY_GLOBE_REFERENCE_PERCENT = 32.0    # what a completely empty globe read
+FULL_LINE_REFERENCE_MM = 439.0          # litterLevel when filled exactly to the full line
+EMPTY_GLOBE_REFERENCE_MM = 484.0        # litterLevel of a completely empty globe
 
 
 def _num(value: float) -> str:
@@ -260,6 +275,11 @@ class DetectionConfig:
     litter_empty_percent: float = 45.0   # litter % <= this is worded "globe looks EMPTY" (0 = off)
     litter_low_states: Tuple[str, ...] = ("LOW", "REFILL", "EMPTY")
     litter_low_repeat_seconds: float = 86400.0
+    # "Very low" tier: last ~20 % of the usable depth between 439 mm (full line)
+    # and 484 mm (empty). The % is only used when the mm value is missing.
+    litter_very_low_mm: float = 475.0            # litterLevel mm >= this (0 = off)
+    litter_very_low_percent: float = 50.0        # fallback: litter % <= this (0 = off)
+    litter_very_low_repeat_seconds: float = 10800.0
     fault_repeat_seconds: float = 3600.0
     offline_seconds: float = 1800.0
     status_grace_seconds: float = 600.0  # bonnet removed / paused / off must persist this long
@@ -288,6 +308,13 @@ class DetectionConfig:
             litter_low_repeat_seconds=float(
                 a.get("litter_low_repeat_seconds", d.litter_low_repeat_seconds)
             ),
+            litter_very_low_mm=float(a.get("litter_very_low_mm", d.litter_very_low_mm)),
+            litter_very_low_percent=float(
+                a.get("litter_very_low_percent", d.litter_very_low_percent)
+            ),
+            litter_very_low_repeat_seconds=float(
+                a.get("litter_very_low_repeat_seconds", d.litter_very_low_repeat_seconds)
+            ),
             fault_repeat_seconds=float(a.get("fault_repeat_seconds", d.fault_repeat_seconds)),
             offline_seconds=float(a.get("offline_minutes", d.offline_seconds / 60)) * 60,
             status_grace_seconds=float(a.get("status_grace_seconds", d.status_grace_seconds)),
@@ -306,6 +333,11 @@ class Alert:
     def critical(self) -> bool:
         """True for incidents that also go out as DMs and get an incident file."""
         return is_critical(self.key)
+
+    @property
+    def dm(self) -> bool:
+        """True when the alert also goes to ``telegram.alert_dm_user_ids``."""
+        return self.critical or self.key in DM_KEYS
 
     @property
     def plain(self) -> str:
@@ -327,6 +359,9 @@ CRITICAL_KEYS = {
     "litter_dump", "globe_motor_fault", "globe_retract_fault", "pinch",
     "offline", "api_unreachable",   # robot offline / monitor blind
 }
+
+# Not a fault (no forensic incident file), but still sent as a DM as well.
+DM_KEYS = {"litter_very_low"}
 
 
 def is_critical(key: str) -> bool:
@@ -377,8 +412,22 @@ class Detector:
         if has_fault(reading):
             self.state["fault_ts"] = now
         alerts += self._dump(prev, reading, now)
+        self._track_very_low(reading)
         conds = self._current_conditions(reading)
         dump = self.incidents.get("litter_dump")
+        if dump:
+            # The dump alert already covers "the globe is empty" (also after
+            # /ack: then the gentle litter_low takes over, see below). Once the
+            # dump incident closes with the litter still very low, this tier
+            # takes over.
+            conds.pop("litter_very_low", None)
+            self.state["cond_since"].pop("litter_very_low", None)
+            self.incidents.pop("litter_very_low", None)
+        elif "litter_very_low" in conds:
+            # one alert per problem: the very-low tier replaces the gentle one
+            conds.pop("litter_low", None)
+            self.state["cond_since"].pop("litter_low", None)
+            self.incidents.pop("litter_low", None)
         if dump and not dump.get("acked"):
             # The dump alert already says the litter is gone; a simultaneous
             # "litter level is REFILL" is noise. Dropped silently (no "OK again").
@@ -521,6 +570,55 @@ class Detector:
         if pct is not None and pct >= self.cfg.dump_resolve_litter_percent:
             return True
         return False
+
+    # ── litter very low ──────────────────────────────────────────────────────
+
+    def _is_very_low(self, mm: Optional[float], pct: Optional[float]) -> bool:
+        cfg = self.cfg
+        if mm is not None:
+            return cfg.litter_very_low_mm > 0 and mm >= cfg.litter_very_low_mm
+        return pct is not None and cfg.litter_very_low_percent > 0 \
+            and pct <= cfg.litter_very_low_percent
+
+    def _level_text(self, pct: Optional[float], mm: Optional[float], refs: bool = True) -> str:
+        parts = []
+        if pct is not None:
+            parts.append(f"{_num(pct)}%")
+        if mm is not None:
+            parts.append(f"{_num(mm)} mm")
+        text = ", ".join(parts)
+        if mm is not None and refs:
+            text += (f"; full line ≈{_num(FULL_LINE_REFERENCE_MM)} mm, "
+                     f"empty ≈{_num(EMPTY_GLOBE_REFERENCE_MM)} mm")
+        return text
+
+    def _track_very_low(self, r: Dict[str, Any]) -> None:
+        """Keep ``state['very_low']`` (the latest at-rest level while the tier is
+        on, else None). Only settled readings count — mid-cycle the litter is
+        thrown around and the last settled verdict simply stands. Once alerted
+        it stays on until the litter is restored (no flapping around 475 mm)."""
+        if not is_settled(r):
+            return
+        pct = r.get("litter_pct")
+        mm = r.get("litter_mm")
+        if isinstance(mm, bool) or not isinstance(mm, (int, float)) or mm <= 0:
+            mm = None
+        if mm is None and pct is None and r.get("litter_state") is None:
+            return                                   # no litter data: cannot tell
+        level = {"pct": pct, "mm": mm}
+        inc = self.incidents.get("litter_very_low")
+        if self._is_very_low(mm, pct):
+            self.state["very_low"] = level
+        elif inc is None:
+            self.state["very_low"] = None            # was only pending / never on
+        elif self._litter_restored(r):
+            self.state["very_low"] = None
+            shown = self._level_text(pct, mm, refs=False) or str(r.get("litter_state"))
+            inc["resolved_text"] = (
+                f"✅ <b>{self._n}</b>: litter is back to a normal level ({shown})."
+            )
+        else:
+            self.state["very_low"] = level           # still low-ish: keep reminding
 
     @staticmethod
     def _note_reading(inc: Dict[str, Any], r: Dict[str, Any], after_fault: bool) -> None:
@@ -718,6 +816,20 @@ class Detector:
                     f"Check power / Wi-Fi."
                 ),
                 "resolved": f"✅ <b>{n}</b> is back online.",
+            }
+
+        very_low = self.state.get("very_low")
+        if very_low:
+            pct_v, mm_v = very_low.get("pct"), very_low.get("mm")
+            level = self._level_text(pct_v, mm_v)
+            empty = " — globe looks EMPTY" if self._looks_empty(pct_v) else ""
+            conds["litter_very_low"] = {
+                "grace": cfg.confirm_seconds, "repeat": cfg.litter_very_low_repeat_seconds,
+                "text": lambda since: (
+                    f"🚨 <b>{n}</b>: litter is <b>VERY low</b>{empty}"
+                    + (f" ({level})" if level else "") + ". Add litter."
+                ),
+                "resolved": f"✅ <b>{n}</b>: litter is back to a normal level.",
             }
 
         state = r.get("litter_state")

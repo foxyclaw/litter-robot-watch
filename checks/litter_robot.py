@@ -620,9 +620,10 @@ class LitterRobotCheck(BaseCheck):
                 self.logger.error(f"Storing alert failed: {e}")
             if self.telegram:
                 try:
-                    # critical: group + DM to telegram.alert_dm_user_ids (first alert,
-                    # every reminder and the resolved message)
-                    if alert.critical and hasattr(self.telegram, "send_critical"):
+                    # critical (and litter very low): group + DM to
+                    # telegram.alert_dm_user_ids (first alert, every reminder and
+                    # the resolved message)
+                    if alert.dm and hasattr(self.telegram, "send_critical"):
                         await self.telegram.send_critical(alert.text)
                     else:
                         await self.telegram.send_reliable(alert.text)
