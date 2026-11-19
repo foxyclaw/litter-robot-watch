@@ -272,10 +272,12 @@ def test_open_litter_low_is_dropped_silently_and_returns_if_litter_stays_low():
     assert [(a.key, a.kind) for a in alerts] == [("litter_dump", "new")]
     assert set(det.incidents) == {"litter_dump"}
     assert _feed(det, 1500, **gone) == []
-    # drawer emptied but nobody refilled the globe: litter_low speaks up again
+    # drawer emptied but nobody refilled the globe: the dump incident stays open
+    # (and keeps litter_low suppressed) — see test_dump_resolution.py
     emptied = dict(litterLevelPercentage=0.6, litterLevelState="REFILL", DFILevelPercent=5)
-    assert [(a.key, a.kind) for a in _feed(det, 1800, **emptied)] == [("litter_dump", "resolved")]
-    assert [(a.key, a.kind) for a in _feed(det, 2100, **emptied)] == [("litter_low", "new")]
+    assert _feed(det, 1800, **emptied) == []
+    assert _feed(det, 2100, **emptied) == []
+    assert set(det.incidents) == {"litter_dump"}
 
 
 def test_incident_persisted_by_the_previous_version_keeps_a_truthful_wording():

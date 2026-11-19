@@ -18,8 +18,13 @@ Signals
       or the litter-level state becomes EMPTY.
   Steps must persist for ``confirm_seconds``, except when a globe fault is
   latched / was just seen, or a dump incident is already open.
+  The incident resolves only when the litter is back (seen low, then a settled
+  reading with a non-low level state or >= ``dump_resolve_litter_percent``);
+  emptying the waste drawer does not resolve it. Reminders stop after
+  ``dump_max_alert_seconds``.
 * ``litter_low``   — litter-level state is LOW / REFILL / EMPTY (suppressed
-  while a ``litter_dump`` incident is open: it would say the same thing twice).
+  while a ``litter_dump`` incident is open and not acknowledged: it would say
+  the same thing twice; it takes over after /ack or the 24 h cap).
 * ``globe_motor_fault`` / ``globe_retract_fault`` / ``pinch`` / ``usb_fault``
 * ``status:<NAME>`` — any status classified "error" (drawer statuses excluded:
   the drawer alert trusts the percentage only).
@@ -32,6 +37,7 @@ Every active problem is an *incident*: alerted once, repeated every
 from __future__ import annotations
 
 import html
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -46,6 +52,8 @@ from status_codes import (
     describe_status,
 )
 from timeutil import fmt_duration
+
+logger = logging.getLogger("detection")
 
 # reading key -> (raw Whisker key, label used in the change log)
 FIELD_MAP: Dict[str, Tuple[str, str]] = {
@@ -231,6 +239,7 @@ class DetectionConfig:
     ignore_zero_waste: bool = True       # 0% right after emptying is not a baseline
     dump_repeat_seconds: float = 3600.0
     dump_max_alert_seconds: float = 86400.0
+    dump_resolve_litter_percent: float = 80.0   # litter % that counts as "refilled"
     litter_low_states: Tuple[str, ...] = ("LOW", "REFILL", "EMPTY")
     litter_low_repeat_seconds: float = 86400.0
     fault_repeat_seconds: float = 3600.0
@@ -251,6 +260,9 @@ class DetectionConfig:
             ignore_zero_waste=bool(a.get("dump_ignore_zero_baseline", d.ignore_zero_waste)),
             dump_repeat_seconds=float(a.get("dump_repeat_seconds", d.dump_repeat_seconds)),
             dump_max_alert_seconds=float(a.get("dump_max_alert_seconds", d.dump_max_alert_seconds)),
+            dump_resolve_litter_percent=float(
+                a.get("dump_resolve_litter_percent", d.dump_resolve_litter_percent)
+            ),
             litter_low_states=tuple(
                 str(s).upper() for s in a.get("litter_low_states", d.litter_low_states)
             ),
@@ -347,9 +359,13 @@ class Detector:
             self.state["fault_ts"] = now
         alerts += self._dump(prev, reading, now)
         conds = self._current_conditions(reading)
-        if "litter_dump" in self.incidents:
+        dump = self.incidents.get("litter_dump")
+        if dump and not dump.get("acked"):
             # The dump alert already says the litter is gone; a simultaneous
             # "litter level is REFILL" is noise. Dropped silently (no "OK again").
+            # Only while the dump incident is open and still reminding: once it
+            # is silenced (/ack) or closed (24 h cap) with the litter still low,
+            # litter_low takes over so an empty globe is never left unreported.
             conds.pop("litter_low", None)
             self.state["cond_since"].pop("litter_low", None)
             self.incidents.pop("litter_low", None)
@@ -457,6 +473,21 @@ class Detector:
             f"({html.escape('; '.join(reasons))}). Check the globe has litter!"
         )
 
+    def _litter_restored(self, r: Dict[str, Any]) -> Optional[bool]:
+        """Is there litter in the globe? True = level state is not one of the
+        low states, or litter % >= ``dump_resolve_litter_percent``; False = low;
+        None = cannot tell (globe not at rest, or no litter data)."""
+        if not is_settled(r):
+            return None
+        state, pct = r.get("litter_state"), r.get("litter_pct")
+        if state is None and pct is None:
+            return None
+        if state is not None and str(state).upper() not in self.cfg.litter_low_states:
+            return True
+        if pct is not None and pct >= self.cfg.dump_resolve_litter_percent:
+            return True
+        return False
+
     def _dump(self, prev: Optional[Dict[str, Any]], r: Dict[str, Any], now: float) -> List[Alert]:
         cfg = self.cfg
         reasons: List[str] = []
@@ -473,6 +504,7 @@ class Detector:
         after_fault = fault_ts is not None and \
             0 <= now - fault_ts <= cfg.window_seconds + cfg.confirm_seconds
         confirm = 0.0 if (after_fault or inc) else None
+        restored = self._litter_restored(r)
 
         if prev:
             ec_prev, ec = prev.get("empty_cycles"), r.get("empty_cycles")
@@ -506,7 +538,7 @@ class Detector:
             kind = "update" if inc else "new"
             if not inc:
                 inc = self.incidents["litter_dump"] = {
-                    "since": now, "reasons": [], "waste_before": None, "litter_min": litter,
+                    "since": now, "reasons": [], "waste_before": None, "litter_was_low": False,
                     "drawer_jump": False, "litter_drop": None, "after_fault": False,
                     "waste_at_open": waste if is_settled(r) else None,
                 }
@@ -518,6 +550,10 @@ class Detector:
                 inc["after_fault"] = bool(after_fault)
             if waste_before is not None and inc.get("waste_before") is None:
                 inc["waste_before"] = waste_before
+            if drawer_jump:
+                inc.pop("drawer_emptied", None)
+            if restored is False:
+                inc["litter_was_low"] = True
             inc["last_alert"] = now
             inc["acked"] = False
             inc["count"] = inc.get("count", 0) + 1
@@ -525,20 +561,27 @@ class Detector:
         if not inc:
             return []
 
-        if litter is not None:
-            inc["litter_min"] = litter if inc.get("litter_min") is None else min(inc["litter_min"], litter)
-        if is_settled(r):
-            cleared = None
-            wb = inc.get("waste_before")
-            if wb is not None and waste is not None and waste <= wb + cfg.waste_jump_points / 2:
-                cleared = f"waste drawer back to {_num(waste)}%"
-            elif (litter is not None and inc.get("litter_min") is not None
-                  and litter - inc["litter_min"] >= cfg.litter_drop_points):
-                cleared = f"litter level back up to {_num(litter)}%"
-            if cleared:
-                del self.incidents["litter_dump"]
-                return [Alert("litter_dump", "resolved",
-                              f"✅ <b>{self._n}</b>: litter-dump alert cleared ({cleared}).", urgent=False)]
+        # Resolved only by the litter coming back: it was seen low during the
+        # incident and a settled reading now shows it restored. The waste drawer
+        # going back down proves nothing — on 2026-11-19 the owner emptied the
+        # drawer during a deep clean while the globe still had no litter.
+        if restored is False:
+            inc["litter_was_low"] = True
+        elif restored and inc.get("litter_was_low"):
+            del self.incidents["litter_dump"]
+            level = f"{_num(litter)}%" if litter is not None else str(r.get("litter_state"))
+            return [Alert("litter_dump", "resolved",
+                          f"✅ <b>{self._n}</b>: litter-dump alert cleared "
+                          f"(litter level back to {level}).", urgent=False)]
+        wb = inc.get("waste_before")
+        if (is_settled(r) and wb is not None and waste is not None and not inc.get("drawer_emptied")
+                and waste <= wb + cfg.waste_jump_points / 2):
+            inc["drawer_emptied"] = True    # logged once, never announced
+            logger.info(
+                f"{self.name}: waste drawer emptied ({_num(waste)}%) while the litter-dump "
+                f"incident is open — litter is {_num(litter) + '%' if litter is not None else 'unknown'} "
+                f"{r.get('litter_state') or ''}, incident stays open until the litter is refilled"
+            )
         if cfg.dump_max_alert_seconds and now - inc["since"] >= cfg.dump_max_alert_seconds:
             del self.incidents["litter_dump"]  # stop nagging after a day
             return []

@@ -212,11 +212,11 @@ def test_dump_alert_repeats_until_resolved():
     later = run(det, [(10 * MIN + i * 5 * MIN, "READY", dict(DFILevelPercent=73)) for i in range(1, 37)])
     assert keys(later) == [("litter_dump", "repeat")] * 3          # 3 hours -> 3 reminders
     assert "Reminder" in later[0][1].text
-    # Pasha fixes it: drawer emptied, level back down
-    fixed = run(det, [(4 * 3600, "READY", dict(DFILevelPercent=16))])
-    assert keys(fixed) == [("litter_dump", "resolved")]
-    assert det.incidents == {}
-    assert run(det, [(5 * 3600, "READY", dict(DFILevelPercent=17))]) == []
+    # the drawer is emptied: that alone never resolves a dump incident
+    emptied = run(det, [(3 * 3600 + 15 * MIN, "READY", dict(DFILevelPercent=16))])
+    assert emptied == [] and "litter_dump" in det.incidents
+    still = run(det, [(4 * 3600 + 10 * MIN, "READY", dict(DFILevelPercent=16))])
+    assert keys(still) == [("litter_dump", "repeat")]
 
 
 def test_dump_resolved_by_litter_refill():
@@ -226,6 +226,7 @@ def test_dump_resolved_by_litter_refill():
     assert "litter_dump" in det.incidents
     alerts = run(det, [(60 * MIN, "READY", dict(litterLevelPercentage=0.9, litterLevelState="OPTIMAL"))])
     assert keys(alerts) == [("litter_dump", "resolved")]   # litter_low was suppressed: no ✅ for it
+    assert "litter level back to 90%" in alerts[0][1].text
     assert det.incidents == {}
 
 

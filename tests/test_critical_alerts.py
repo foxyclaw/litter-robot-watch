@@ -116,14 +116,18 @@ def test_dump_alert_goes_to_group_and_dms_on_first_alert_reminder_and_resolved(t
         await feed(check, 5 * MIN, DFILevelPercent=73)              # dump -> first alert
         for chat in (GROUP, ALICE, BOB):
             assert len(tg.to(chat)) == 1 and "🚨" in tg.to(chat)[0] and "19%→73%" in tg.to(chat)[0]
-        await feed(check, 20 * MIN, DFILevelPercent=73)             # < 30 min: quiet
+        low = dict(litterLevelPercentage=0.7, litterLevelState="LOW")
+        await feed(check, 20 * MIN, DFILevelPercent=73, **low)      # < 30 min: quiet
         assert len(tg.sent) == 3
-        await feed(check, 36 * MIN, DFILevelPercent=73)             # reminder
+        await feed(check, 36 * MIN, DFILevelPercent=73, **low)      # reminder
         for chat in (GROUP, ALICE, BOB):
             assert len(tg.to(chat)) == 2 and "Reminder" in tg.to(chat)[1]
-        await feed(check, 40 * MIN, DFILevelPercent=5)              # drawer emptied -> resolved
+        await feed(check, 38 * MIN, DFILevelPercent=5, **low)       # drawer emptied: says nothing
+        assert len(tg.sent) == 6
+        await feed(check, 40 * MIN, DFILevelPercent=5)              # litter refilled -> resolved
         for chat in (GROUP, ALICE, BOB):
             assert len(tg.to(chat)) == 3 and tg.to(chat)[2].startswith("✅")
+            assert "litter level back to 90%" in tg.to(chat)[2]
         await check.wait_background()
         await check.db.disconnect()
     run(scenario())
@@ -273,8 +277,9 @@ def test_incident_file_is_written_on_open_and_completed_on_resolve(tmp_path):
         assert doc["activity_fresh"]["new_entries"] == 1
         assert doc["resolved"] is None and [a["kind"] for a in doc["alerts"]] == ["new"]
 
-        await feed(check, 31 * MIN, DFILevelPercent=73)             # reminder
-        await feed(check, 40 * MIN, DFILevelPercent=4)              # resolved
+        await feed(check, 31 * MIN, DFILevelPercent=73,             # reminder; litter reads low
+                   litterLevelPercentage=0.7, litterLevelState="LOW")
+        await feed(check, 40 * MIN, DFILevelPercent=4)              # litter back -> resolved
         await check.wait_background()
         files = incident_files(tmp_path)
         assert len(files) == 1                                      # same file, updated in place

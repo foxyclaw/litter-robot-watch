@@ -65,6 +65,8 @@ checks:
         dump_ignore_zero_baseline: true # 0% right after emptying the drawer is not a baseline
         dump_repeat_seconds: 3600       # remind every hour until resolved or /ack
         dump_max_alert_seconds: 86400   # stop reminding after a day
+        dump_resolve_litter_percent: 80 # incident clears when litter is back: state not low, or % >= this
+                                        # (emptying the waste drawer does NOT clear it)
         # ── Litter level state ──
         litter_low_states: ["LOW", "REFILL", "EMPTY"]
         litter_low_repeat_seconds: 86400

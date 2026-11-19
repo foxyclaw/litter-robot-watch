@@ -18,8 +18,8 @@ silenced with `/ack`.
 
 | Alert | Trigger | Repeat |
 |-------|---------|--------|
-| 🚨 **Litter missing / dumped** | Any of: litter level steps down by ≥ `dump_litter_drop_points` (25) — *stage 1: litter missing from the globe or globe not level* · waste-drawer level steps up by ≥ `dump_waste_jump_points` (25) within `dump_window_seconds` (15 min) — *stage 2: litter dumped into the drawer* · the empty-cycle odometer increments · an `EMPTY_CYCLE` status is seen · litter-level state becomes `EMPTY`. A step must persist for `dump_confirm_seconds` (5 min), except right after a globe fault or when the incident is already open | every `dump_repeat_seconds` (1 h) for up to `dump_max_alert_seconds` (24 h) |
-| ⚠️ Litter low | litter-level state in `litter_low_states` (LOW / REFILL / EMPTY). Suppressed while a litter-dump incident is open (it would repeat the same news) | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
+| 🚨 **Litter missing / dumped** | Any of: litter level steps down by ≥ `dump_litter_drop_points` (25) — *stage 1: litter missing from the globe or globe not level* · waste-drawer level steps up by ≥ `dump_waste_jump_points` (25) within `dump_window_seconds` (15 min) — *stage 2: litter dumped into the drawer* · the empty-cycle odometer increments · an `EMPTY_CYCLE` status is seen · litter-level state becomes `EMPTY`. A step must persist for `dump_confirm_seconds` (5 min), except right after a globe fault or when the incident is already open | every `dump_repeat_seconds` (1 h) for up to `dump_max_alert_seconds` (24 h). Clears only when the litter is back: level state no longer low, or litter ≥ `dump_resolve_litter_percent` (80 %) on an at-rest reading. Emptying the waste drawer does **not** clear it (logged only) |
+| ⚠️ Litter low | litter-level state in `litter_low_states` (LOW / REFILL / EMPTY). Suppressed while a litter-dump incident is open and not yet `/ack`ed (it would repeat the same news); takes over after `/ack` or the 24 h cap if the litter is still low | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
 | 🚨 Globe motor fault / retract fault | status ≠ `FAULT_CLEAR` | every `fault_repeat_seconds` (1 h) |
 | 🚨 Pinch detected | pinch status / pinch fault reported | 1 h |
 | ⚠️ USB fault | `USBFaultStatus` ≠ `CLEAR` | 1 h |
@@ -194,6 +194,7 @@ credentials) and edit it. Keys of the `litter_robot` check:
 | `config.alerts.dump_ignore_zero_baseline` | true | ignore 0 % readings as a baseline |
 | `config.alerts.dump_repeat_seconds` | 3600 | dump reminder interval |
 | `config.alerts.dump_max_alert_seconds` | 86400 | stop dump reminders after this long |
+| `config.alerts.dump_resolve_litter_percent` | 80 | litter % that clears a dump incident (or a non-low level state) |
 | `config.alerts.litter_low_states` | LOW, REFILL, EMPTY | litter states that alert |
 | `config.alerts.litter_low_repeat_seconds` | 86400 | litter-low reminder interval |
 | `config.alerts.fault_repeat_seconds` | 3600 | fault / offline reminder interval |
