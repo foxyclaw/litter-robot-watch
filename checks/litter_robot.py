@@ -35,8 +35,8 @@ from detection import (
     _enum_str,
     diff_fields,
     extract_fields,
+    fast_poll_reason,
     format_changes,
-    is_active,
 )
 from forensics import SnapshotLog
 from incidents import IncidentStore, utc_iso
@@ -48,6 +48,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 INCIDENT_SNAPSHOT_WINDOW_SECONDS = 1800   # raw snapshots kept in an incident file
 INCIDENT_ACTIVITY_ENTRIES = 50            # stored activity entries kept in an incident file
+
+WS_STALE_SECONDS = 180          # AppSync sends a keep-alive frame every 60 s
+WS_RESUBSCRIBE_MIN_SECONDS = 300
+WS_REPORT_SECONDS = 3600        # websocket health line in the log
 
 ACTIVITY_QUERY = """
 query GetLR4Activity($serial: String!, $limit: Int, $consumer: String) {
@@ -102,6 +106,11 @@ class LitterRobotCheck(BaseCheck):
         self._last_activity_sync: Dict[str, float] = {}
         self._last_prune: float = 0.0
         self._fast_until: float = 0.0
+        self._fast_on: bool = False
+        self._ws_since: Dict[str, float] = {}     # robot id -> subscribed at
+        self._ws_stats: Dict[str, int] = {"pushes": 0, "pushes_new_data": 0, "poll_first": 0}
+        self._ws_last_report: float = 0.0
+        self._ws_last_resubscribe: float = 0.0
         self._refreshing: bool = False
         self._lock = asyncio.Lock()
         self._ws_tasks: set = set()
@@ -126,8 +135,35 @@ class LitterRobotCheck(BaseCheck):
 
     @property
     def interval_override(self) -> Optional[float]:
-        """Scheduler hint: poll faster while a cycle / fault / pending alert is in progress."""
-        return self.fast_interval if time.time() < self._fast_until else None
+        """Scheduler hint: poll faster while a cycle / fault / incident is in progress."""
+        return self.fast_interval if self.fast_poll_reason() else None
+
+    def fast_poll_reason(self, now: Optional[float] = None, hold: bool = True) -> Optional[str]:
+        """Why the check must poll fast right now (None = normal interval).
+
+        Derived from the current state on every call, not from a timer, so it
+        cannot lapse while the reason persists (2026-11-19: with an open
+        incident and FAULT_TIMEOUT latched the old timer ran out and the
+        08:00 cycle was polled at 5 min). Fast while:
+          * the robot is doing something or is not at rest: active status,
+            ``robotCycleStatus`` != CYCLE_IDLE, ``displayCode`` != DC_MODE_IDLE,
+            globe motor / retract fault not clear, ``robotCycleState`` FAULT_*;
+          * any incident is open, or an alert is waiting for confirmation;
+          * for ``fast_poll_hold_seconds`` after the last of the above.
+        """
+        for robot_id, det in self.detectors.items():
+            reason = fast_poll_reason(self._last_fields.get(robot_id))
+            if reason:
+                return reason
+            if det.incidents:
+                return "open incident " + ", ".join(sorted(det.incidents))
+            if det.has_pending():
+                return "alert waiting for confirmation"
+        if self._api_detector is not None and self._api_detector.incidents:
+            return "open incident " + ", ".join(sorted(self._api_detector.incidents))
+        if hold and (time.time() if now is None else now) < self._fast_until:
+            return "hold after activity"
+        return None
 
     # ── connection ───────────────────────────────────────────────────────────
 
@@ -145,6 +181,7 @@ class LitterRobotCheck(BaseCheck):
             except Exception:
                 pass
         self._ws_unsubs = []
+        self._ws_since = {}
         if self.account:
             try:
                 await asyncio.wait_for(self.account.disconnect(), timeout=15)
@@ -234,7 +271,13 @@ class LitterRobotCheck(BaseCheck):
     async def _subscribe_realtime(self) -> None:
         """Best effort: pylitterbot keeps the socket alive and reconnects with
         backoff; regular polling continues regardless, so a dead socket only
-        costs us the extra in-between snapshots."""
+        costs us the extra in-between snapshots.
+
+        What to expect (checked live on 2026-11-19 with pylitterbot 2025.3.2):
+        the subscription is acknowledged, AppSync sends a keep-alive every 60 s
+        and a ``data`` frame only when Whisker's backend publishes a change.
+        ``_check_ws_health`` logs how many pushes arrived versus changes that
+        polling saw first, and re-subscribes when the socket goes silent."""
         try:
             from pylitterbot.event import EVENT_UPDATE
         except Exception as e:
@@ -244,13 +287,77 @@ class LitterRobotCheck(BaseCheck):
             try:
                 self._ws_unsubs.append(robot.on(EVENT_UPDATE, lambda r=robot: self._on_robot_update(r)))
                 await asyncio.wait_for(robot.subscribe(), timeout=30)
+                self._ws_since[robot.id] = time.time()
                 self.logger.info(f"Websocket updates subscribed for {robot.name}")
             except Exception as e:
+                self._ws_since.pop(robot.id, None)
                 self.logger.warning(f"Websocket subscribe failed for {robot.name} ({type(e).__name__}: {e}) — polling only")
+
+    def _ws_last_frame(self, robot: Robot) -> Optional[float]:
+        """Epoch of the last frame (data or keep-alive) on the robot's socket."""
+        last = getattr(getattr(robot, "_transport", None), "_last_received", None)
+        try:
+            return last.timestamp() if last is not None else None
+        except Exception:
+            return None
+
+    def _ws_summary(self, now: float) -> str:
+        st = self._ws_stats
+        ages = []
+        for rid in self._ws_since:
+            robot = self.robots.get(rid)
+            last = self._ws_last_frame(robot) if robot else None
+            ages.append(f"last frame {now - last:.0f}s ago" if last else "no frame yet")
+        return (
+            f"{', '.join(ages) or 'not subscribed'}; {st['pushes']} push(es), "
+            f"{st['pushes_new_data']} with new data; {st['poll_first']} change(s) seen first by polling"
+        )
+
+    async def _check_ws_health(self, now: Optional[float] = None) -> bool:
+        """Log websocket health; re-subscribe when the socket has gone silent
+        (no data and no keep-alive for WS_STALE_SECONDS: a half-open connection
+        that pylitterbot cannot notice by itself). Returns True if re-subscribed."""
+        if not self._ws_since:
+            return False
+        now = time.time() if now is None else now
+        stale = []
+        for rid, since in self._ws_since.items():
+            robot = self.robots.get(rid)
+            if robot is None:
+                continue
+            last = self._ws_last_frame(robot)
+            if now - max(last or 0.0, since) > WS_STALE_SECONDS:
+                stale.append(robot)
+        if stale and now - self._ws_last_resubscribe >= WS_RESUBSCRIBE_MIN_SECONDS:
+            self._ws_last_resubscribe = now
+            self.logger.warning(
+                f"Websocket silent for more than {WS_STALE_SECONDS}s "
+                f"({self._ws_summary(now)}) — re-subscribing; polling continues"
+            )
+            robots = [r for r in self.robots.values() if r.id in self._ws_since]
+            for robot in robots:
+                try:
+                    await asyncio.wait_for(robot.unsubscribe(), timeout=15)
+                except Exception as e:
+                    self.logger.debug(f"Websocket unsubscribe: {type(e).__name__}: {e}")
+            for robot in robots:
+                try:
+                    await asyncio.wait_for(robot.subscribe(), timeout=30)
+                    self._ws_since[robot.id] = now
+                except Exception as e:
+                    self.logger.warning(
+                        f"Websocket re-subscribe failed for {robot.name} "
+                        f"({type(e).__name__}: {e}) — polling only")
+            return True
+        if now - self._ws_last_report >= WS_REPORT_SECONDS:
+            self._ws_last_report = now
+            self.logger.info(f"Websocket health: {self._ws_summary(now)}")
+        return False
 
     def _on_robot_update(self, robot: Robot) -> None:
         if self._refreshing or not self._connected:
             return  # our own poll; handled by run()
+        self._ws_stats["pushes"] += 1
         try:
             task = asyncio.get_running_loop().create_task(self._handle_ws_update(robot))
         except RuntimeError:
@@ -262,7 +369,9 @@ class LitterRobotCheck(BaseCheck):
         try:
             raw = copy.deepcopy(robot.to_dict())
             if self._signature(raw) == self._last_raw_sig.get(robot.id):
+                self.logger.debug(f"Websocket push for {robot.name}: no new data")
                 return
+            self._ws_stats["pushes_new_data"] += 1
             await self.process_snapshot(robot.id, self._get_state_dict(robot), raw, source="ws")
         except Exception as e:
             self.logger.error(f"Websocket update handling failed: {type(e).__name__}: {e}")
@@ -312,6 +421,10 @@ class LitterRobotCheck(BaseCheck):
             except Exception as e:
                 self.logger.warning(f"Activity history sync failed: {type(e).__name__}: {e}")
 
+        try:
+            await self._check_ws_health()
+        except Exception as e:
+            self.logger.warning(f"Websocket health check failed: {type(e).__name__}: {e}")
         await self._maintenance()
         if self.telegram and hasattr(self.telegram, "ensure_retry_task"):
             self.telegram.ensure_retry_task()
@@ -454,6 +567,8 @@ class LitterRobotCheck(BaseCheck):
             changes = diff_fields(self._last_fields.get(robot_id), fields)
             if changes:
                 self.logger.info(f"CHANGE {name} [{source}]: {format_changes(changes)}")
+                if source == "poll" and robot_id in self._ws_since:
+                    self._ws_stats["poll_first"] += 1   # no push announced this change
             self._last_fields[robot_id] = fields
 
             self.logger.info(
@@ -478,13 +593,17 @@ class LitterRobotCheck(BaseCheck):
             if not self.dry_run:
                 await self.db.set_kv(f"detector:{robot_id}", det.state)
 
-            # 5. poll faster while something is going on
-            if is_active(fields) or det.has_pending():
-                if time.time() >= self._fast_until:
-                    self.logger.info(
-                        f"Fast polling ({self.fast_interval:.0f}s) while {name} is active"
-                    )
-                self._fast_until = time.time() + self.fast_hold
+            # 5. poll faster while something is going on: robot not at rest,
+            #    fault latched, incident open, alert pending (+ hold afterwards)
+            reason = self.fast_poll_reason(now, hold=False)
+            if reason:
+                if not self._fast_on:
+                    self.logger.info(f"Fast polling ({self.fast_interval:.0f}s) on for {name}: {reason}")
+                self._fast_on = True
+                self._fast_until = now + self.fast_hold
+            elif self._fast_on and now >= self._fast_until:
+                self._fast_on = False
+                self.logger.info(f"Fast polling off for {name}: at rest, no open incident")
             return alerts
 
     async def _dispatch(self, robot_id: str, alerts: List[Alert],
@@ -709,7 +828,7 @@ class LitterRobotCheck(BaseCheck):
         if not robot or not hasattr(robot, "get_activity_history"):
             return 0
         now = time.time()
-        interval = min(self.activity_interval, 60) if now < self._fast_until else self.activity_interval
+        interval = min(self.activity_interval, 60) if self.fast_poll_reason(now) else self.activity_interval
         if not force and now - self._last_activity_sync.get(robot_id, 0) < interval:
             return 0
         self._last_activity_sync[robot_id] = now

@@ -44,7 +44,9 @@ checks:
       # Capture transient states
       realtime:
         websocket: true                 # Whisker push updates; polling continues regardless
-        fast_poll_interval_seconds: 30  # poll this fast while a cycle / fault is in progress
+        # poll this fast while a cycle runs, a fault field is not clear, the display
+        # is not DC_MODE_IDLE, an alert is pending or ANY incident is open ...
+        fast_poll_interval_seconds: 30
         fast_poll_hold_seconds: 300     # ... and for this long afterwards
       alerts:
         waste_levels:

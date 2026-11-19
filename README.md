@@ -18,8 +18,8 @@ silenced with `/ack`.
 
 | Alert | Trigger | Repeat |
 |-------|---------|--------|
-| 🚨 **Litter likely dumped** | Any of: waste-drawer level steps up by ≥ `dump_waste_jump_points` (25) within `dump_window_seconds` (15 min) and stays there for `dump_confirm_seconds` (5 min) · litter level steps down by ≥ `dump_litter_drop_points` (25) · the empty-cycle odometer increments · an `EMPTY_CYCLE` status is seen · litter-level state becomes `EMPTY` | every `dump_repeat_seconds` (1 h) for up to `dump_max_alert_seconds` (24 h) |
-| ⚠️ Litter low | litter-level state in `litter_low_states` (LOW / REFILL / EMPTY) | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
+| 🚨 **Litter missing / dumped** | Any of: litter level steps down by ≥ `dump_litter_drop_points` (25) — *stage 1: litter missing from the globe or globe not level* · waste-drawer level steps up by ≥ `dump_waste_jump_points` (25) within `dump_window_seconds` (15 min) — *stage 2: litter dumped into the drawer* · the empty-cycle odometer increments · an `EMPTY_CYCLE` status is seen · litter-level state becomes `EMPTY`. A step must persist for `dump_confirm_seconds` (5 min), except right after a globe fault or when the incident is already open | every `dump_repeat_seconds` (1 h) for up to `dump_max_alert_seconds` (24 h) |
+| ⚠️ Litter low | litter-level state in `litter_low_states` (LOW / REFILL / EMPTY). Suppressed while a litter-dump incident is open (it would repeat the same news) | every `litter_low_repeat_seconds` (24 h); at once when it gets worse |
 | 🚨 Globe motor fault / retract fault | status ≠ `FAULT_CLEAR` | every `fault_repeat_seconds` (1 h) |
 | 🚨 Pinch detected | pinch status / pinch fault reported | 1 h |
 | ⚠️ USB fault | `USBFaultStatus` ≠ `CLEAR` | 1 h |
@@ -27,10 +27,16 @@ silenced with `/ack`.
 | 📡 Offline | robot offline, or the monitor cannot reach the Whisker cloud, for more than `offline_minutes` (30) | 1 h |
 | 🗑️ Waste drawer full | waste level ≥ `waste_threshold` (90 %). **The percentage only** — the robot's own "drawer full" flag/status is flaky and is ignored | every `waste_repeat_seconds` (3 h) |
 
-Example:
+The dump usually happens in two stages (seen on 6 occasions, see the 2026-11-19
+replay in `tests/test_incident_20261119.py`), and the alert says which one it is.
+"Into the drawer" is only ever claimed once the drawer level has jumped:
 
-> 🚨 **COPTiP**: litter appears to have been dumped into the waste drawer
-> (litter level 90%→44% in 10 min; waste drawer 19%→73% in 5 min). Check the globe has litter!
+> 🚨 **COPTiP**: litter level dropped 90%→40% after a failed cycle — litter missing
+> from the globe or globe not level. Do NOT let it cycle again until checked (the
+> next cycle tends to dump the litter into the drawer). [waste drawer unchanged at 16%]
+
+> 🚨 **COPTiP**: litter dumped into the waste drawer (litter level 90%→40% in 2 min;
+> waste drawer 16%→75% in 2 min). The globe is probably empty. Check the globe has litter!
 
 Notes on the dump detector:
 
@@ -99,7 +105,8 @@ The plain log tells the story of an incident, e.g.:
 ```
 CHANGE COPTiP [poll]: litter% 90.0→44.0; litterState OPTIMAL→REFILL
 CHANGE COPTiP [poll]: status CAT_DETECTED→READY; waste% 19→73
-ALERT [litter_dump/new] 🚨 COPTiP: litter appears to have been dumped into the waste drawer (...)
+ALERT [litter_dump/new] 🚨 COPTiP: litter level dropped 90%→44% — litter missing from the globe or globe not level. (...)
+ALERT [litter_dump/update] 🚨 COPTiP: litter dumped into the waste drawer (...)
 ```
 
 Fields tracked for changes: status, waste %, litter % / state / mm, empty / clean /
@@ -120,14 +127,26 @@ zcat -f data/robot_snapshots-*.jsonl* | jq -c '[.ts, .status, .data.DFILevelPerc
 
 ### Catching transient states
 
-- **Fast polling** — the normal interval is `interval_seconds` (300). While a cat
-  is in the globe, a cycle is running, or an alert is waiting for confirmation,
-  the check polls every `fast_poll_interval_seconds` (30) and keeps doing so for
-  `fast_poll_hold_seconds` (300) afterwards.
+- **Fast polling** — the normal interval is `interval_seconds` (300). The check
+  polls every `fast_poll_interval_seconds` (30) for as long as *any* of these
+  holds, and for `fast_poll_hold_seconds` (300) afterwards:
+  a cat is in the globe or a cycle is running · `robotCycleStatus` ≠ `CYCLE_IDLE` ·
+  `displayCode` ≠ `DC_MODE_IDLE` · `globeMotorFaultStatus` /
+  `globeMotorRetractFaultStatus` ≠ `FAULT_CLEAR` · `robotCycleState` is `FAULT_*` ·
+  any incident is open (until it resolves or expires — `/ack` does not end it) ·
+  an alert is waiting for confirmation.
+  The reason is derived from the current state on every scheduler tick, so it
+  cannot time out while it still applies; the log says
+  `Fast polling (30s) on for <robot>: <reason>` and `Fast polling off …`.
+  Note that a long-lived incident (robot offline, bonnet left off) therefore
+  means 30 s polling for as long as it lasts.
 - **Websocket** (`realtime.websocket: true`) — subscribes to Whisker's push
-  updates; every push that changes the data is stored and analysed like a poll.
-  pylitterbot reconnects on its own with backoff, and polling continues
-  regardless, so a dead socket only costs the in-between snapshots.
+  updates; every push that changes the data is stored and analysed like a poll
+  (`CHANGE … [ws]`). Polling continues regardless, so a dead socket only costs
+  the in-between snapshots. Whisker does not push every change, so the log
+  carries an hourly `Websocket health:` line (age of the last frame, pushes
+  received, changes that polling saw first), and a socket that has been silent
+  for 3 min — AppSync sends a keep-alive every minute — is re-subscribed.
 
 ## Telegram commands
 
