@@ -42,6 +42,40 @@ Notes on the dump detector:
 - The waste sensor is noisy, so an occasional false alarm from a large jump is
   possible; raise `dump_waste_jump_points` if it bothers you.
 
+### Critical alerts as direct messages
+
+The 🚨 incidents that need someone right now — **litter dumped, globe motor /
+retract fault, pinch, hardware error status, offline (robot or Whisker cloud)**
+— are sent to the group *and* as a direct message to every user ID listed in
+`telegram.alert_dm_user_ids`: the first alert, every reminder, and the ✅
+resolved message. Routine alerts (waste drawer %, low litter, USB, bonnet
+removed / paused) stay in the group only.
+
+A bot can only DM someone who has opened it and pressed **Start**. Until then
+Telegram answers 403; that is logged as one WARNING per user per day and the DM
+is dropped rather than retried. Everything else goes through the same retry
+queue as the group alerts.
+
+### Incident files
+
+When a critical incident opens, a forensic file is written to
+`data/incidents/<YYYYmmdd-HHMMSS>-<kind>.json` (UTC time the incident opened;
+gitignored). It contains:
+
+| Key | |
+|-----|---|
+| `trigger` | why it fired (the alert text) and the detector's incident details |
+| `current_raw` | the full raw `to_dict()` at that moment |
+| `raw_snapshots` | every raw snapshot of the previous 30 minutes (or as many as exist) |
+| `activity_history` | the last 50 stored activity-feed entries |
+| `activity_fresh` | the activity feed fetched from Whisker right after the incident opened (read-only query) |
+| `alerts` | every alert sent for this incident (new / reminder / resolved) |
+| `resolved` | added when the incident resolves: reason, raw dict, last 30 minutes of snapshots, activity |
+
+The same file is updated in place; if it no longer exists when the incident
+resolves, a `…-<kind>-resolved.json` file is written instead. Incident files
+are not pruned automatically.
+
 Alert delivery is queued: if Telegram is unreachable the message is retried
 with exponential backoff (5 s … 5 min, for up to 24 h) and the queue is kept in
 `data/telegram_outbox*.json` so it survives a restart. Late messages are marked
@@ -148,6 +182,7 @@ credentials) and edit it. Keys of the `litter_robot` check:
 | `config.alerts.status_grace_seconds` | 600 | bonnet removed / paused / off grace |
 | `config.alerts.error_statuses` | — | extra statuses to alert on (short codes like `BR` or names like `BONNET_REMOVED`) |
 | `telegram.authorized_user_ids` | `[]` | user IDs whose DMs the bot answers |
+| `telegram.alert_dm_user_ids` | `[]` | user IDs that also get critical alerts as a DM (see above) |
 
 ## Smoke test
 
@@ -169,14 +204,18 @@ venv/bin/python -m pytest
 
 Offline unit tests (no network): the 2026-11-10 dump sequence, normal
 increments, empty-cycle counter, motor / pinch / USB faults, offline, the
-waste-drawer rule, storage and rotation, alert retry queue, bot authorization
-and time-zone formatting.
+waste-drawer rule, storage and rotation, alert retry queue, critical-alert DMs
+(including the 403 case), incident files, bot authorization and time-zone
+formatting.
 
 ## Running as a service (macOS launchd)
 
 `install_service.sh` installs `com.litterrobot.monitor.plist` as a user
 LaunchAgent that runs `venv/bin/python main.py daemon`; `restart_service.sh`
 restarts it. After changing code or `config.yaml`, restart the service.
+
+To run it by hand in the foreground instead, use `./start.sh` (a thin wrapper
+around `venv/bin/python main.py daemon`, run from the script's own directory).
 
 ## Layout
 
@@ -187,7 +226,8 @@ restarts it. After changing code or `config.yaml`, restart the service.
 | `detection.py` | pure detection logic, clock injected, fully unit-tested |
 | `status_codes.py` | status names and classification |
 | `forensics.py`, `database.py` | JSONL writer, SQLite storage |
-| `notifier.py` | Telegram sending with retry queue |
+| `incidents.py` | incident files (`data/incidents/*.json`) |
+| `notifier.py` | Telegram sending with retry queue, critical-alert DMs |
 | `telegram_bot.py` | Telegram commands for the litter robot |
 | `checks/stock_price.py`, `telegram_command_bot.py` | stock price check and its bot |
 | `timeutil.py` | time-zone helpers |

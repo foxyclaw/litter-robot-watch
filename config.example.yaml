@@ -8,6 +8,12 @@ telegram:
   # Telegram user IDs whose direct messages to the bot are also answered
   # (replies go to the chat the command came from). Empty = group chat only.
   authorized_user_ids: []
+  # Telegram user IDs that ALSO get critical alerts as a direct message, in
+  # addition to the group: litter dumped, globe motor / retract fault, pinch,
+  # hardware error status, offline — first alert, every reminder and the ✅
+  # resolved message. Not used for routine alerts (waste drawer, low litter).
+  # Each user must open the bot and press Start once, or Telegram answers 403.
+  alert_dm_user_ids: []
 
 # Logging
 logging:
