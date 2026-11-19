@@ -6,13 +6,20 @@ across restarts and replayed in unit tests.
 
 Signals
 -------
-* ``litter_dump``  — litter probably ended up in the waste drawer:
-    - waste-drawer level steps up by >= ``waste_jump_points`` (default 25)
-      within ``window_seconds`` and stays there for ``confirm_seconds``;
-    - litter level steps down by >= ``litter_drop_points`` (default 25);
-    - the empty-cycle odometer increments, or an EMPTY_CYCLE status is seen;
-    - the litter-level state becomes EMPTY.
-* ``litter_low``   — litter-level state is LOW / REFILL / EMPTY.
+* ``litter_dump``  — the litter left the globe bed. Two stages, worded differently:
+    - stage 1: litter level steps down by >= ``litter_drop_points`` (default 25)
+      while the drawer has not moved — litter missing from the globe or the
+      globe not level (typically after a failed cycle / globe motor fault).
+      The alert says so and never claims the litter is in the drawer;
+    - stage 2: waste-drawer level steps up by >= ``waste_jump_points``
+      (default 25) within ``window_seconds`` — only now the alert says the
+      litter was dumped into the drawer;
+    - also: the empty-cycle odometer increments, an EMPTY_CYCLE status is seen,
+      or the litter-level state becomes EMPTY.
+  Steps must persist for ``confirm_seconds``, except when a globe fault is
+  latched / was just seen, or a dump incident is already open.
+* ``litter_low``   — litter-level state is LOW / REFILL / EMPTY (suppressed
+  while a ``litter_dump`` incident is open: it would say the same thing twice).
 * ``globe_motor_fault`` / ``globe_retract_fault`` / ``pinch`` / ``usb_fault``
 * ``status:<NAME>`` — any status classified "error" (drawer statuses excluded:
   the drawer alert trusts the percentage only).
@@ -175,11 +182,39 @@ def is_settled(reading: Dict[str, Any]) -> bool:
     return reading.get("cycle_status") in (None, "", "CYCLE_IDLE")
 
 
+def has_fault(reading: Dict[str, Any]) -> bool:
+    """True while any globe fault field is latched (motor / retract fault not
+    clear, or the cycle state machine sits in a FAULT_* state)."""
+    if reading.get("globe_fault") not in FAULT_OK or reading.get("retract_fault") not in FAULT_OK:
+        return True
+    return str(reading.get("cycle_state") or "").startswith("CYCLE_STATE_FAULT")
+
+
+def fast_poll_reason(reading: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why this reading deserves fast polling (None = the robot is at rest).
+
+    A latched fault or a non-idle display means the robot may start moving
+    again on its own (2026-11-19: FAULT_TIMEOUT latched for 74 min, then a
+    cycle from idle with no cat detection dumped the litter)."""
+    r = reading or {}
+    if r.get("status") in ACTIVE_STATUSES:
+        return f"status {r['status']}"
+    if r.get("cycle_status") not in (None, "", "CYCLE_IDLE"):
+        return f"cycleStatus {r['cycle_status']}"
+    if r.get("globe_fault") not in FAULT_OK:
+        return f"globeMotorFault {r['globe_fault']}"
+    if r.get("retract_fault") not in FAULT_OK:
+        return f"globeRetractFault {r['retract_fault']}"
+    if str(r.get("cycle_state") or "").startswith("CYCLE_STATE_FAULT"):
+        return f"cycleState {r['cycle_state']}"
+    if r.get("display_code") not in (None, "", "DC_MODE_IDLE"):
+        return f"displayCode {r['display_code']}"
+    return None
+
+
 def is_active(reading: Dict[str, Any]) -> bool:
     """True when something is happening that deserves faster polling."""
-    if reading.get("status") in ACTIVE_STATUSES:
-        return True
-    return reading.get("cycle_status") not in (None, "", "CYCLE_IDLE")
+    return fast_poll_reason(reading) is not None
 
 
 def _num(value: float) -> str:
@@ -308,8 +343,17 @@ class Detector:
         """Feed one reading (from ``extract_fields``); returns alerts to send."""
         prev = self.state.get("last")
         alerts: List[Alert] = []
+        if has_fault(reading):
+            self.state["fault_ts"] = now
         alerts += self._dump(prev, reading, now)
-        alerts += self._conditions(self._current_conditions(reading), now, exclude={"api_unreachable"})
+        conds = self._current_conditions(reading)
+        if "litter_dump" in self.incidents:
+            # The dump alert already says the litter is gone; a simultaneous
+            # "litter level is REFILL" is noise. Dropped silently (no "OK again").
+            conds.pop("litter_low", None)
+            self.state["cond_since"].pop("litter_low", None)
+            self.incidents.pop("litter_low", None)
+        alerts += self._conditions(conds, now, exclude={"api_unreachable"})
         alerts += self._conditions({}, now, only={"api_unreachable"})  # we got data -> reachable
         self.state["last"] = dict(reading, ts=now)
         return alerts
@@ -340,8 +384,11 @@ class Detector:
         return html.escape(self.name)
 
     def _step(self, key: str, ts: float, value: float, direction: int,
-              threshold: float) -> Optional[Dict[str, Any]]:
-        """Track a level and report a confirmed step of >= threshold in `direction`."""
+              threshold: float, confirm: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Track a level and report a confirmed step of >= threshold in `direction`.
+
+        ``confirm`` overrides ``confirm_seconds`` (0 = report at once)."""
+        confirm = self.cfg.confirm_seconds if confirm is None else confirm
         st = self.state["steps"].setdefault(key, {"history": [], "pending": None})
         hist: List[List[float]] = st["history"]
         cutoff = ts - self.cfg.window_seconds
@@ -358,7 +405,7 @@ class Detector:
         if pending:
             if (value - pending["from"]) * direction >= threshold:
                 pending["to"] = value
-                if ts - pending["since"] >= self.cfg.confirm_seconds:
+                if ts - pending["since"] >= confirm:
                     result = pending
             else:
                 st["pending"] = None  # transient blip
@@ -367,7 +414,7 @@ class Detector:
             ref = min(reversed(hist), key=lambda h: h[1] * direction)
             if (value - ref[1]) * direction >= threshold:
                 pending = {"since": ts, "from": ref[1], "from_ts": ref[0], "to": value}
-                if self.cfg.confirm_seconds <= 0:
+                if confirm <= 0:
                     result = pending
                 else:
                     st["pending"] = pending
@@ -378,17 +425,54 @@ class Detector:
         return result
 
     def _dump_text(self, inc: Dict[str, Any]) -> str:
+        """Stage-aware wording. "Into the drawer" is only ever said once the
+        drawer level has actually jumped."""
+        n = self._n
+        reasons = list(inc.get("reasons") or [])
+        drawer = inc.get("drawer_jump")
+        if drawer is None and any(r.startswith("waste drawer ") for r in reasons):
+            drawer = True   # incident opened by an older version
+        drop = inc.get("litter_drop")
+        if drawer:
+            return (
+                f"🚨 <b>{n}</b>: litter dumped into the waste drawer "
+                f"({html.escape('; '.join(reasons))}). The globe is probably empty. "
+                f"Check the globe has litter!"
+            )
+        if drop:
+            pair = f"{_num(drop[0])}%→{_num(drop[1])}%"
+            extra = [r for r in reasons if not r.startswith("litter level ")]
+            if inc.get("waste_at_open") is not None:
+                extra.append(f"waste drawer unchanged at {_num(inc['waste_at_open'])}%")
+            return (
+                f"🚨 <b>{n}</b>: litter level dropped {pair}"
+                + (" after a failed cycle" if inc.get("after_fault") else "")
+                + " — litter missing from the globe or globe not level. "
+                "Do NOT let it cycle again until checked (the next cycle tends to dump "
+                "the litter into the drawer)."
+                + (f" [{html.escape('; '.join(extra))}]" if extra else "")
+            )
         return (
-            f"🚨 <b>{self._n}</b>: litter appears to have been dumped into the waste drawer "
-            f"({html.escape('; '.join(inc['reasons']))}). Check the globe has litter!"
+            f"🚨 <b>{n}</b>: the globe may have been emptied "
+            f"({html.escape('; '.join(reasons))}). Check the globe has litter!"
         )
 
     def _dump(self, prev: Optional[Dict[str, Any]], r: Dict[str, Any], now: float) -> List[Alert]:
         cfg = self.cfg
         reasons: List[str] = []
         waste_before = None
+        drawer_jump = False
+        litter_drop: Optional[List[float]] = None
         status = r.get("status")
         waste, litter = r.get("waste"), r.get("litter_pct")
+        inc = self.incidents.get("litter_dump")
+        # A globe fault now / just before the step ("failed cycle"), or an
+        # already open dump incident, is corroboration enough: do not spend
+        # ``confirm_seconds`` waiting — the next cycle may dump the litter.
+        fault_ts = self.state.get("fault_ts")
+        after_fault = fault_ts is not None and \
+            0 <= now - fault_ts <= cfg.window_seconds + cfg.confirm_seconds
+        confirm = 0.0 if (after_fault or inc) else None
 
         if prev:
             ec_prev, ec = prev.get("empty_cycles"), r.get("empty_cycles")
@@ -401,29 +485,37 @@ class Detector:
 
         if is_settled(r):
             if waste is not None and not (cfg.ignore_zero_waste and waste <= 0):
-                step = self._step("waste", now, float(waste), +1, cfg.waste_jump_points)
+                step = self._step("waste", now, float(waste), +1, cfg.waste_jump_points, confirm)
                 if step:
                     waste_before = step["from"]
+                    drawer_jump = True
                     reasons.append(
                         f"waste drawer {_num(step['from'])}%→{_num(step['to'])}% in "
                         f"{fmt_duration(step['since'] - step['from_ts'])}"
                     )
             if litter is not None:
-                step = self._step("litter", now, float(litter), -1, cfg.litter_drop_points)
+                step = self._step("litter", now, float(litter), -1, cfg.litter_drop_points, confirm)
                 if step:
+                    litter_drop = [step["from"], step["to"]]
                     reasons.append(
                         f"litter level {_num(step['from'])}%→{_num(step['to'])}% in "
                         f"{fmt_duration(step['since'] - step['from_ts'])}"
                     )
 
-        inc = self.incidents.get("litter_dump")
         if reasons:
             kind = "update" if inc else "new"
             if not inc:
                 inc = self.incidents["litter_dump"] = {
                     "since": now, "reasons": [], "waste_before": None, "litter_min": litter,
+                    "drawer_jump": False, "litter_drop": None, "after_fault": False,
+                    "waste_at_open": waste if is_settled(r) else None,
                 }
             inc["reasons"] += [x for x in reasons if x not in inc["reasons"]]
+            if drawer_jump:
+                inc["drawer_jump"] = True
+            if litter_drop and not inc.get("litter_drop"):
+                inc["litter_drop"] = litter_drop
+                inc["after_fault"] = bool(after_fault)
             if waste_before is not None and inc.get("waste_before") is None:
                 inc["waste_before"] = waste_before
             inc["last_alert"] = now

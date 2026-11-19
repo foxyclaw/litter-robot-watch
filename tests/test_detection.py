@@ -64,7 +64,8 @@ def test_nov10_immediate_when_confirmation_disabled():
 
 def test_nov10_full_sequence_from_db_history():
     """What the DB actually recorded: litter 90%->44% (REFILL) at 17:45, waste
-    19%->73% at 18:10. The litter drop alone must alert ~25 min earlier."""
+    19%->73% at 18:10. The litter drop alone must alert ~25 min earlier — and
+    must not claim the litter is in the drawer until the drawer actually jumps."""
     det = Detector("COPTiP", DetectionConfig())
     ok = dict(DFILevelPercent=19, litterLevelPercentage=0.9, litterLevelState="OPTIMAL")
     low = dict(DFILevelPercent=19, litterLevelPercentage=0.44, litterLevelState="REFILL")
@@ -75,14 +76,21 @@ def test_nov10_full_sequence_from_db_history():
         (15 * MIN, "READY", low),                # confirmed
         (20 * MIN, "READY", low), (25 * MIN, "CAT_DETECTED", low), (30 * MIN, "CAT_DETECTED", low),
         (35 * MIN, "READY", dumped),             # 18:10 waste jumps
-        (40 * MIN, "READY", dumped),             # confirmed -> update with 2nd reason
+        (40 * MIN, "READY", dumped),
     ])
     dump = [(t, a) for t, a in alerts if a.key == "litter_dump"]
-    assert [(t, a.kind) for t, a in dump] == [(15 * MIN, "new"), (40 * MIN, "update")]
-    assert "litter level 90%→44%" in dump[0][1].text
-    assert "waste drawer 19%→73%" in dump[1][1].text and "litter level 90%→44%" in dump[1][1].text
-    # the REFILL state is also reported on its own
-    assert ("litter_low", "new") in keys(alerts)
+    # the drawer jump needs no second confirmation once a dump incident is open
+    assert [(t, a.kind) for t, a in dump] == [(15 * MIN, "new"), (35 * MIN, "update")]
+    stage1, stage2 = dump[0][1].text, dump[1][1].text
+    assert "litter level dropped 90%→44%" in stage1
+    assert "litter missing from the globe or globe not level" in stage1
+    assert "Do NOT let it cycle again until checked" in stage1
+    assert "waste drawer unchanged at 19%" in stage1
+    assert "dumped into the waste drawer" not in stage1 and "failed cycle" not in stage1
+    assert "litter dumped into the waste drawer" in stage2
+    assert "waste drawer 19%→73%" in stage2 and "litter level 90%→44%" in stage2
+    # the REFILL state is not reported a second time while the dump incident is open
+    assert all(a.key != "litter_low" for _t, a in alerts)
 
 
 def test_normal_small_increments_do_not_alert():
@@ -217,8 +225,8 @@ def test_dump_resolved_by_litter_refill():
     run(det, [(0, "READY", {}), (5 * MIN, "READY", low), (10 * MIN, "READY", low)])
     assert "litter_dump" in det.incidents
     alerts = run(det, [(60 * MIN, "READY", dict(litterLevelPercentage=0.9, litterLevelState="OPTIMAL"))])
-    assert ("litter_dump", "resolved") in keys(alerts)
-    assert ("litter_low", "resolved") in keys(alerts)
+    assert keys(alerts) == [("litter_dump", "resolved")]   # litter_low was suppressed: no ✅ for it
+    assert det.incidents == {}
 
 
 def test_dump_reminders_stop_after_ack_and_after_max_age():
